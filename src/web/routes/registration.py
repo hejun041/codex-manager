@@ -182,6 +182,30 @@ def task_to_response(task: RegistrationTask) -> RegistrationTaskResponse:
     )
 
 
+def _normalize_email_service_config(
+    service_type: EmailServiceType,
+    config: Optional[dict],
+    proxy_url: Optional[str] = None
+) -> dict:
+    """按服务类型兼容旧字段名，避免不同服务的配置键互相污染。"""
+    normalized = config.copy() if config else {}
+
+    if 'api_url' in normalized and 'base_url' not in normalized:
+        normalized['base_url'] = normalized.pop('api_url')
+
+    if service_type == EmailServiceType.CUSTOM_DOMAIN:
+        if 'domain' in normalized and 'default_domain' not in normalized:
+            normalized['default_domain'] = normalized.pop('domain')
+    elif service_type == EmailServiceType.TEMP_MAIL:
+        if 'default_domain' in normalized and 'domain' not in normalized:
+            normalized['domain'] = normalized.pop('default_domain')
+
+    if proxy_url and 'proxy_url' not in normalized:
+        normalized['proxy_url'] = proxy_url
+
+    return normalized
+
+
 def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: Optional[str], email_service_config: Optional[dict], email_service_id: Optional[int] = None, log_prefix: str = "", batch_id: str = "", auto_upload_cpa: bool = False, cpa_service_id: Optional[int] = None):
     """
     在线程池中执行的同步注册任务
@@ -236,15 +260,11 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                 ).first()
 
                 if db_service:
-                    config = db_service.config.copy() if db_service.config else {}
-                    # 兼容旧版字段名 api_url -> base_url
-                    if 'api_url' in config and 'base_url' not in config:
-                        config['base_url'] = config.pop('api_url')
-                    if 'domain' in config and 'default_domain' not in config:
-                        config['default_domain'] = config.pop('domain')
+                    service_type = EmailServiceType(db_service.service_type)
+                    config = _normalize_email_service_config(service_type, db_service.config, actual_proxy_url)
                     # 更新任务关联的邮箱服务
                     crud.update_registration_task(db, task_uuid, email_service_id=db_service.id)
-                    logger.info(f"使用数据库邮箱服务: {db_service.name} (ID: {db_service.id})")
+                    logger.info(f"使用数据库邮箱服务: {db_service.name} (ID: {db_service.id}, 类型: {service_type.value})")
                 else:
                     raise ValueError(f"邮箱服务不存在或已禁用: {email_service_id}")
             else:
@@ -265,12 +285,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                     ).order_by(EmailServiceModel.priority.asc()).first()
 
                     if db_service and db_service.config:
-                        config = db_service.config.copy()
-                        # 兼容旧版字段名 api_url -> base_url
-                        if 'api_url' in config and 'base_url' not in config:
-                            config['base_url'] = config.pop('api_url')
-                        if 'domain' in config and 'default_domain' not in config:
-                            config['default_domain'] = config.pop('domain')
+                        config = _normalize_email_service_config(service_type, db_service.config, actual_proxy_url)
                         crud.update_registration_task(db, task_uuid, email_service_id=db_service.id)
                         logger.info(f"使用数据库自定义域名服务: {db_service.name}")
                     elif settings.custom_domain_base_url and settings.custom_domain_api_key:

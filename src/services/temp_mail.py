@@ -8,7 +8,12 @@ import re
 import time
 import json
 import logging
-from typing import Optional, Dict, Any
+from email import message_from_string
+from email.header import decode_header, make_header
+from email.message import Message
+from email.policy import default as email_policy
+from html import unescape
+from typing import Optional, Dict, Any, List
 
 from .base import BaseEmailService, EmailServiceError, EmailServiceType
 from ..core.http_client import HTTPClient, RequestConfig
@@ -62,6 +67,97 @@ class TempMailService(BaseEmailService):
 
         # 邮箱缓存：email -> {jwt, address}
         self._email_cache: Dict[str, Dict[str, Any]] = {}
+
+    def _decode_mime_header(self, value: str) -> str:
+        """解码 MIME 头，兼容 RFC 2047 编码主题。"""
+        if not value:
+            return ""
+        try:
+            return str(make_header(decode_header(value)))
+        except Exception:
+            return value
+
+    def _extract_body_from_message(self, message: Message) -> str:
+        """从 MIME 邮件对象中提取可读正文。"""
+        parts: List[str] = []
+
+        if message.is_multipart():
+            for part in message.walk():
+                if part.get_content_maintype() == "multipart":
+                    continue
+
+                content_type = (part.get_content_type() or "").lower()
+                if content_type not in ("text/plain", "text/html"):
+                    continue
+
+                try:
+                    payload = part.get_payload(decode=True)
+                    charset = part.get_content_charset() or "utf-8"
+                    text = payload.decode(charset, errors="replace") if payload else ""
+                except Exception:
+                    try:
+                        text = part.get_content()
+                    except Exception:
+                        text = ""
+
+                if content_type == "text/html":
+                    text = re.sub(r"<[^>]+>", " ", text)
+                parts.append(text)
+        else:
+            try:
+                payload = message.get_payload(decode=True)
+                charset = message.get_content_charset() or "utf-8"
+                body = payload.decode(charset, errors="replace") if payload else ""
+            except Exception:
+                try:
+                    body = message.get_content()
+                except Exception:
+                    body = str(message.get_payload() or "")
+
+            if "html" in (message.get_content_type() or "").lower():
+                body = re.sub(r"<[^>]+>", " ", body)
+            parts.append(body)
+
+        return unescape("\n".join(part for part in parts if part).strip())
+
+    def _extract_mail_fields(self, mail: Dict[str, Any]) -> Dict[str, str]:
+        """统一提取邮件字段，兼容 raw MIME 和不同 Worker 返回格式。"""
+        sender = str(
+            mail.get("source")
+            or mail.get("from")
+            or mail.get("from_address")
+            or mail.get("fromAddress")
+            or ""
+        ).strip()
+        subject = str(mail.get("subject") or mail.get("title") or "").strip()
+        body_text = str(
+            mail.get("text")
+            or mail.get("body")
+            or mail.get("content")
+            or mail.get("html")
+            or ""
+        ).strip()
+        raw = str(mail.get("raw") or "").strip()
+
+        if raw:
+            try:
+                message = message_from_string(raw, policy=email_policy)
+                sender = sender or self._decode_mime_header(message.get("From", ""))
+                subject = subject or self._decode_mime_header(message.get("Subject", ""))
+                parsed_body = self._extract_body_from_message(message)
+                if parsed_body:
+                    body_text = f"{body_text}\n{parsed_body}".strip() if body_text else parsed_body
+            except Exception as e:
+                logger.debug(f"解析 TempMail raw 邮件失败: {e}")
+                body_text = f"{body_text}\n{raw}".strip() if body_text else raw
+
+        body_text = unescape(re.sub(r"<[^>]+>", " ", body_text))
+        return {
+            "sender": sender,
+            "subject": subject,
+            "body": body_text,
+            "raw": raw,
+        }
 
     def _admin_headers(self) -> Dict[str, str]:
         """构造 admin 请求头"""
@@ -224,14 +320,12 @@ class TempMailService(BaseEmailService):
 
                     seen_mail_ids.add(mail_id)
 
-                    sender = str(mail.get("source", "")).lower()
-                    subject = str(mail.get("subject", ""))
-                    body_text = str(mail.get("text", "") or mail.get("html", "") or "")
-
-                    # 去除简单 HTML 标签
-                    body_clean = re.sub(r"<[^>]+>", " ", body_text)
-
-                    content = f"{sender} {subject} {body_clean}"
+                    parsed = self._extract_mail_fields(mail)
+                    sender = parsed["sender"].lower()
+                    subject = parsed["subject"]
+                    body_text = parsed["body"]
+                    raw_text = parsed["raw"]
+                    content = f"{sender}\n{subject}\n{body_text}\n{raw_text}".strip()
 
                     # 只处理 OpenAI 邮件
                     if "openai" not in sender and "openai" not in content.lower():
@@ -251,6 +345,88 @@ class TempMailService(BaseEmailService):
 
         logger.warning(f"等待 TempMail 验证码超时: {email}")
         return None
+
+    def list_emails(self, limit: int = 100, offset: int = 0, **kwargs) -> List[Dict[str, Any]]:
+        """
+        列出邮箱
+
+        Args:
+            limit: 返回数量上限
+            offset: 分页偏移
+            **kwargs: 额外查询参数，透传给 admin API
+
+        Returns:
+            邮箱列表
+        """
+        params = {
+            "limit": limit,
+            "offset": offset,
+        }
+        params.update({k: v for k, v in kwargs.items() if v is not None})
+
+        try:
+            response = self._make_request("GET", "/admin/mails", params=params)
+            mails = response.get("results", [])
+            if not isinstance(mails, list):
+                raise EmailServiceError(f"API 返回数据格式错误: {response}")
+
+            emails: List[Dict[str, Any]] = []
+            for mail in mails:
+                address = (mail.get("address") or "").strip()
+                mail_id = mail.get("id") or address
+                email_info = {
+                    "id": mail_id,
+                    "service_id": mail_id,
+                    "email": address,
+                    "subject": mail.get("subject"),
+                    "from": mail.get("source"),
+                    "created_at": mail.get("createdAt") or mail.get("created_at"),
+                    "raw_data": mail,
+                }
+                emails.append(email_info)
+
+                if address:
+                    cached = self._email_cache.get(address, {})
+                    self._email_cache[address] = {**cached, **email_info}
+
+            self.update_status(True)
+            return emails
+        except Exception as e:
+            logger.warning(f"列出 TempMail 邮箱失败: {e}")
+            self.update_status(False, e)
+            return list(self._email_cache.values())
+
+    def delete_email(self, email_id: str) -> bool:
+        """
+        删除邮箱
+
+        Note:
+            当前 TempMail admin API 文档未见删除地址接口，这里先从本地缓存移除，
+            以满足统一接口并避免服务实例化失败。
+        """
+        removed = False
+        emails_to_delete = []
+
+        for address, info in self._email_cache.items():
+            candidate_ids = {
+                address,
+                info.get("id"),
+                info.get("service_id"),
+            }
+            if email_id in candidate_ids:
+                emails_to_delete.append(address)
+
+        for address in emails_to_delete:
+            self._email_cache.pop(address, None)
+            removed = True
+
+        if removed:
+            logger.info(f"已从 TempMail 缓存移除邮箱: {email_id}")
+            self.update_status(True)
+        else:
+            logger.info(f"TempMail 缓存中未找到邮箱: {email_id}")
+
+        return removed
 
     def check_health(self) -> bool:
         """检查服务健康状态"""

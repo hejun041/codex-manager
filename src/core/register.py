@@ -214,21 +214,41 @@ class RegistrationEngine:
 
     def _get_device_id(self) -> Optional[str]:
         """获取 Device ID"""
-        try:
-            if not self.oauth_start:
-                return None
-
-            response = self.session.get(
-                self.oauth_start.auth_url,
-                timeout=15
-            )
-            did = self.session.cookies.get("oai-did")
-            self._log(f"Device ID: {did}")
-            return did
-
-        except Exception as e:
-            self._log(f"获取 Device ID 失败: {e}", "error")
+        if not self.oauth_start:
             return None
+
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if not self.session:
+                    self.session = self.http_client.session
+
+                response = self.session.get(
+                    self.oauth_start.auth_url,
+                    timeout=20
+                )
+                did = self.session.cookies.get("oai-did")
+
+                if did:
+                    self._log(f"Device ID: {did}")
+                    return did
+
+                self._log(
+                    f"获取 Device ID 失败: 未返回 oai-did Cookie (HTTP {response.status_code}, 第 {attempt}/{max_attempts} 次)",
+                    "warning" if attempt < max_attempts else "error"
+                )
+            except Exception as e:
+                self._log(
+                    f"获取 Device ID 失败: {e} (第 {attempt}/{max_attempts} 次)",
+                    "warning" if attempt < max_attempts else "error"
+                )
+
+            if attempt < max_attempts:
+                time.sleep(attempt)
+                self.http_client.close()
+                self.session = self.http_client.session
+
+        return None
 
     def _check_sentinel(self, did: str) -> Optional[str]:
         """检查 Sentinel 拦截"""
