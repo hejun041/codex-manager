@@ -360,6 +360,12 @@ SETTING_DEFINITIONS: Dict[str, SettingDefinition] = {
         category=SettingCategory.CPA,
         description="每一次测活的间隔时间（秒）"
     ),
+    "cpa_auto_check_min_remaining_weekly_percent": SettingDefinition(
+        db_key="cpa.auto_check_min_remaining_weekly_percent",
+        default_value=20,
+        category=SettingCategory.CPA,
+        description="周限额剩余百分比低于该值时剔除（0 表示关闭）"
+    ),
     "cpa_auto_check_test_url": SettingDefinition(
         db_key="cpa.auto_check_test_url",
         default_value="https://chatgpt.com/backend-api/wham/usage",
@@ -462,6 +468,7 @@ SETTING_TYPES: Dict[str, Type] = {
     "cpa_auto_check_enabled": bool,
     "cpa_auto_check_interval": int,
     "cpa_auto_check_sleep_seconds": int,
+    "cpa_auto_check_min_remaining_weekly_percent": int,
     "cpa_auto_check_test_url": str,
     "cpa_auto_check_test_model": str,
     "cpa_auto_register_enabled": bool,
@@ -754,6 +761,7 @@ class Settings(BaseModel):
     cpa_auto_check_enabled: bool = False
     cpa_auto_check_interval: int = 60
     cpa_auto_check_sleep_seconds: int = 1
+    cpa_auto_check_min_remaining_weekly_percent: int = 20
     cpa_auto_check_test_url: str = "https://chatgpt.com/backend-api/wham/usage"
     cpa_auto_check_test_model: str = "gpt-5.2-codex"
     cpa_auto_register_enabled: bool = False

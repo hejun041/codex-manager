@@ -99,6 +99,7 @@ const elements = {
     cpaTestModel: document.getElementById('cpa-test-model'),
     cpaCheckInterval: document.getElementById('cpa-check-interval'),
     cpaCheckSleep: document.getElementById('cpa-check-sleep'),
+    cpaCheckMinRemainingWeeklyPercent: document.getElementById('cpa-check-min-remaining-weekly-percent'),
     cpaAutoRegisterEnabled: document.getElementById('cpa-auto-register-enabled'),
     cpaRegisterThreshold: document.getElementById('cpa-register-threshold'),
     cpaRegisterBatchCount: document.getElementById('cpa-register-batch-count'),
@@ -127,6 +128,10 @@ async function loadSchedulerConfig() {
         if (elements.cpaTestModel) elements.cpaTestModel.value = config.test_model || '';
         if (elements.cpaCheckInterval) elements.cpaCheckInterval.value = config.check_interval;
         if (elements.cpaCheckSleep) elements.cpaCheckSleep.value = config.check_sleep;
+        if (elements.cpaCheckMinRemainingWeeklyPercent) {
+            elements.cpaCheckMinRemainingWeeklyPercent.value =
+                config.check_min_remaining_weekly_percent ?? 20;
+        }
         if (elements.cpaAutoRegisterEnabled) elements.cpaAutoRegisterEnabled.checked = config.register_enabled;
 
         // 更新徽标状态
@@ -272,6 +277,7 @@ async function handleSaveSchedulerConfig() {
             check_enabled: elements.cpaAutoCheckEnabled.checked,
             check_interval: parseInt(elements.cpaCheckInterval.value) || 60,
             check_sleep: parseInt(elements.cpaCheckSleep.value) || 0,
+            check_min_remaining_weekly_percent: parseInt(elements.cpaCheckMinRemainingWeeklyPercent.value) || 0,
             test_url: elements.cpaTestUrl.value,
             test_model: elements.cpaTestModel ? elements.cpaTestModel.value : "",
             register_enabled: elements.cpaAutoRegisterEnabled.checked,
@@ -299,6 +305,7 @@ async function handleStopSchedulerTask() {
             check_enabled: false,
             check_interval: parseInt(elements.cpaCheckInterval.value) || 60,
             check_sleep: parseInt(elements.cpaCheckSleep.value) || 0,
+            check_min_remaining_weekly_percent: parseInt(elements.cpaCheckMinRemainingWeeklyPercent.value) || 0,
             test_url: elements.cpaTestUrl.value,
             test_model: elements.cpaTestModel ? elements.cpaTestModel.value : "",
             register_enabled: false,

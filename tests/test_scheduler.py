@@ -37,6 +37,7 @@ def test_test_cliproxy_auth_file_marks_rate_limited_response_invalid(monkeypatch
         lambda: SimpleNamespace(
             cpa_auto_check_test_url="https://chatgpt.com/backend-api/wham/usage",
             cpa_auto_check_test_model="gpt-5.3-codex",
+            cpa_auto_check_min_remaining_weekly_percent=20,
         ),
     )
 
@@ -54,6 +55,75 @@ def test_test_cliproxy_auth_file_marks_rate_limited_response_invalid(monkeypatch
     assert "rate_limit" in message
     assert calls[0]["url"] == "https://cpa.example.com/v0/management/api-call"
     assert calls[0]["kwargs"]["json"]["header"]["Chatgpt-Account-Id"] == "acct-123"
+
+
+def test_test_cliproxy_auth_file_marks_low_remaining_weekly_quota_invalid(monkeypatch):
+    def fake_post(url, **kwargs):
+        return FakeResponse(
+            status_code=200,
+            payload={
+                "status_code": 200,
+                "body": (
+                    '{"rate_limit": {"allowed": true, "limit_reached": false,'
+                    ' "primary_window": {"used_percent": 81}}}'
+                ),
+            },
+        )
+
+    monkeypatch.setattr(scheduler_core.cffi_requests, "post", fake_post)
+    monkeypatch.setattr(
+        scheduler_core,
+        "get_settings",
+        lambda: SimpleNamespace(
+            cpa_auto_check_test_url="https://chatgpt.com/backend-api/wham/usage",
+            cpa_auto_check_test_model="gpt-5.3-codex",
+            cpa_auto_check_min_remaining_weekly_percent=20,
+        ),
+    )
+
+    success, message = scheduler_core.test_cliproxy_auth_file(
+        {"name": "demo.json", "auth_index": "auth-123"},
+        api_url="https://cpa.example.com",
+        api_token="token-123",
+    )
+
+    assert success is False
+    assert "remaining_percent=19" in message
+    assert "threshold=20" in message
+
+
+def test_test_cliproxy_auth_file_allows_low_remaining_quota_when_threshold_disabled(monkeypatch):
+    def fake_post(url, **kwargs):
+        return FakeResponse(
+            status_code=200,
+            payload={
+                "status_code": 200,
+                "body": (
+                    '{"rate_limit": {"allowed": true, "limit_reached": false,'
+                    ' "primary_window": {"used_percent": 81}}}'
+                ),
+            },
+        )
+
+    monkeypatch.setattr(scheduler_core.cffi_requests, "post", fake_post)
+    monkeypatch.setattr(
+        scheduler_core,
+        "get_settings",
+        lambda: SimpleNamespace(
+            cpa_auto_check_test_url="https://chatgpt.com/backend-api/wham/usage",
+            cpa_auto_check_test_model="gpt-5.3-codex",
+            cpa_auto_check_min_remaining_weekly_percent=0,
+        ),
+    )
+
+    success, message = scheduler_core.test_cliproxy_auth_file(
+        {"name": "demo.json", "auth_index": "auth-123"},
+        api_url="https://cpa.example.com",
+        api_token="token-123",
+    )
+
+    assert success is True
+    assert message == "status_code=200"
 
 
 def test_test_cliproxy_auth_file_marks_unavailable_item_invalid(monkeypatch):

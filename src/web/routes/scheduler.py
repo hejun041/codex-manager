@@ -13,6 +13,7 @@ class CPASchedulerConfig(BaseModel):
     check_enabled: bool
     check_interval: int
     check_sleep: int
+    check_min_remaining_weekly_percent: int = 20
     test_url: str
     test_model: str
     register_enabled: bool
@@ -28,6 +29,7 @@ async def get_cpa_scheduler_config():
         "check_enabled": settings.cpa_auto_check_enabled,
         "check_interval": settings.cpa_auto_check_interval,
         "check_sleep": settings.cpa_auto_check_sleep_seconds,
+        "check_min_remaining_weekly_percent": settings.cpa_auto_check_min_remaining_weekly_percent,
         "test_url": settings.cpa_auto_check_test_url,
         "test_model": settings.cpa_auto_check_test_model,
         "register_enabled": settings.cpa_auto_register_enabled,
@@ -57,6 +59,7 @@ async def update_cpa_scheduler_config(request: CPASchedulerConfig, background_ta
         cpa_auto_check_enabled=request.check_enabled,
         cpa_auto_check_interval=request.check_interval,
         cpa_auto_check_sleep_seconds=request.check_sleep,
+        cpa_auto_check_min_remaining_weekly_percent=request.check_min_remaining_weekly_percent,
         cpa_auto_check_test_url=request.test_url,
         cpa_auto_check_test_model=request.test_model,
         cpa_auto_register_enabled=request.register_enabled,

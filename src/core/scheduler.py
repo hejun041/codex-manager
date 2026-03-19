@@ -77,17 +77,54 @@ def _decode_possible_json_payload(payload: Any) -> Any:
     return payload
 
 
-def _extract_rate_limit_reason(rate_info: Any, key: str) -> Optional[str]:
+def _extract_remaining_percent(window_info: Any) -> Optional[float]:
+    if not isinstance(window_info, dict):
+        return None
+
+    remaining_percent = window_info.get("remaining_percent")
+    if isinstance(remaining_percent, (int, float)):
+        return max(0.0, min(100.0, float(remaining_percent)))
+
+    used_percent = window_info.get("used_percent")
+    if isinstance(used_percent, (int, float)):
+        return max(0.0, min(100.0, 100.0 - float(used_percent)))
+
+    return None
+
+
+def _format_percent(value: float) -> str:
+    normalized = round(float(value), 2)
+    if normalized.is_integer():
+        return str(int(normalized))
+    return f"{normalized:.2f}".rstrip("0").rstrip(".")
+
+
+def _extract_rate_limit_reason(
+    rate_info: Any,
+    key: str,
+    min_remaining_weekly_percent: int = 0,
+) -> Optional[str]:
     if not isinstance(rate_info, dict):
         return None
     allowed = rate_info.get("allowed")
     limit_reached = rate_info.get("limit_reached")
     if allowed is False or limit_reached is True:
         return f"{key}: allowed={allowed}, limit_reached={limit_reached}"
+
+    if key == "rate_limit" and min_remaining_weekly_percent > 0:
+        remaining_percent = _extract_remaining_percent(rate_info.get("primary_window"))
+        if remaining_percent is not None and remaining_percent < min_remaining_weekly_percent:
+            return (
+                f"{key}: remaining_percent={_format_percent(remaining_percent)}"
+                f" < threshold={min_remaining_weekly_percent}"
+            )
     return None
 
 
-def _extract_cliproxy_failure_reason(payload: Any) -> Optional[str]:
+def _extract_cliproxy_failure_reason(
+    payload: Any,
+    min_remaining_weekly_percent: int = 0,
+) -> Optional[str]:
     data = _decode_possible_json_payload(payload)
 
     if isinstance(data, str):
@@ -115,7 +152,12 @@ def _extract_cliproxy_failure_reason(payload: Any) -> Optional[str]:
             return str(message)
 
     for key in ("rate_limit", "code_review_rate_limit"):
-        reason = _extract_rate_limit_reason(data.get(key), key)
+        min_remaining_percent = min_remaining_weekly_percent if key == "rate_limit" else 0
+        reason = _extract_rate_limit_reason(
+            data.get(key),
+            key,
+            min_remaining_percent,
+        )
         if reason:
             return reason
 
@@ -125,6 +167,7 @@ def _extract_cliproxy_failure_reason(payload: Any) -> Optional[str]:
             reason = _extract_rate_limit_reason(
                 rate_info,
                 f"additional_rate_limits[{index}]",
+                0,
             )
             if reason:
                 return reason
@@ -133,12 +176,16 @@ def _extract_cliproxy_failure_reason(payload: Any) -> Optional[str]:
             reason = _extract_rate_limit_reason(
                 rate_info,
                 f"additional_rate_limits.{key}",
+                0,
             )
             if reason:
                 return reason
 
     for key in ("data", "body", "response", "text", "content", "status_message"):
-        reason = _extract_cliproxy_failure_reason(data.get(key))
+        reason = _extract_cliproxy_failure_reason(
+            data.get(key),
+            min_remaining_weekly_percent,
+        )
         if reason:
             return reason
 
@@ -156,8 +203,14 @@ def _extract_cliproxy_failure_reason(payload: Any) -> Optional[str]:
     return None
 
 
-def _extract_cliproxy_item_failure_reason(item: dict) -> Optional[str]:
-    reason = _extract_cliproxy_failure_reason(item.get("status_message"))
+def _extract_cliproxy_item_failure_reason(
+    item: dict,
+    min_remaining_weekly_percent: int = 0,
+) -> Optional[str]:
+    reason = _extract_cliproxy_failure_reason(
+        item.get("status_message"),
+        min_remaining_weekly_percent,
+    )
     if item.get("unavailable") is True:
         return f"unavailable ({reason or item.get('status') or 'unknown'})"
 
@@ -173,7 +226,16 @@ def test_cliproxy_auth_file(item: dict, api_url: str, api_token: str) -> tuple[b
     if not auth_index:
         return False, "missing auth_index"
 
-    item_failure_reason = _extract_cliproxy_item_failure_reason(item)
+    settings = get_settings()
+    min_remaining_weekly_percent = int(
+        getattr(settings, "cpa_auto_check_min_remaining_weekly_percent", 0) or 0
+    )
+    min_remaining_weekly_percent = max(0, min(100, min_remaining_weekly_percent))
+
+    item_failure_reason = _extract_cliproxy_item_failure_reason(
+        item,
+        min_remaining_weekly_percent,
+    )
     if item_failure_reason:
         return False, item_failure_reason
 
@@ -186,7 +248,6 @@ def test_cliproxy_auth_file(item: dict, api_url: str, api_token: str) -> tuple[b
     if account_id:
         call_header["Chatgpt-Account-Id"] = account_id
 
-    settings = get_settings()
     test_url = settings.cpa_auto_check_test_url or "https://chatgpt.com/backend-api/wham/usage"
     test_model = settings.cpa_auto_check_test_model or "gpt-5.2-codex"
     
@@ -228,7 +289,10 @@ def test_cliproxy_auth_file(item: dict, api_url: str, api_token: str) -> tuple[b
     if not isinstance(status_code, int):
         return False, "missing status_code"
 
-    failure_reason = _extract_cliproxy_failure_reason(data)
+    failure_reason = _extract_cliproxy_failure_reason(
+        data,
+        min_remaining_weekly_percent,
+    )
     if status_code >= 400 or failure_reason:
         suffix = f" - {failure_reason}" if failure_reason else ""
         return False, f"status_code={status_code}{suffix}"
