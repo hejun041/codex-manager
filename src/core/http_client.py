@@ -14,6 +14,7 @@ from curl_cffi.requests import Session, Response
 
 from ..config.constants import ERROR_MESSAGES
 from ..config.settings import get_settings
+from .openai.sentinel import SentinelPOWError, build_sentinel_pow_token
 
 
 logger = logging.getLogger(__name__)
@@ -363,7 +364,12 @@ class OpenAIHTTPClient(HTTPClient):
         from ..config.constants import OPENAI_API_ENDPOINTS
 
         try:
-            sen_req_body = f'{{"p":"","id":"{did}","flow":"authorize_continue"}}'
+            pow_token = build_sentinel_pow_token(self.default_headers.get("User-Agent", ""))
+            sen_req_body = json.dumps({
+                "p": pow_token,
+                "id": did,
+                "flow": "authorize_continue",
+            }, separators=(",", ":"))
 
             response = self.post(
                 OPENAI_API_ENDPOINTS["sentinel"],
@@ -381,6 +387,9 @@ class OpenAIHTTPClient(HTTPClient):
                 logger.warning(f"Sentinel 检查失败: {response.status_code}")
                 return None
 
+        except SentinelPOWError as e:
+            logger.error(f"Sentinel POW 求解失败: {e}")
+            return None
         except Exception as e:
             logger.error(f"Sentinel 检查异常: {e}")
             return None

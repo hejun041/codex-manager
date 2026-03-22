@@ -25,6 +25,11 @@
   - 批量注册（可配置数量和间隔时间）
   - Outlook 批量注册（指定账户逐一注册）
 
+- **注册 / 登录链路**
+  - **新注册账号**：先完成邮箱注册、密码设置与建号，再自动切换到登录流程获取 `access_token` / `refresh_token` / `session_token`
+  - **已注册邮箱**：检测到邮箱已注册后，自动跳过建号流程，直接走登录 + 邮箱验证码获取 token
+  - 登录取 token 与定时守护 / 自动补货任务解耦，互不影响
+
 - **并发控制**
   - 流水线模式（Pipeline）：每隔 interval 秒启动新任务，限制最大并发数
   - 并行模式（Parallel）：所有任务同时提交，Semaphore 控制最大并发
@@ -341,6 +346,7 @@ docker-compose up -d --build --force-recreate
 - 代理优先级：动态代理 > 代理列表（随机/默认） > 直连
 - CPA / Sub2API / Team Manager 上传始终直连，不走代理
 - 注册时自动随机生成用户名和生日（年龄范围 18-45 岁）
+- 新注册账号会在建号完成后自动补走一次登录流程，以获取完整 token；已注册邮箱则直接进入登录流程
 - 支付链接生成使用账号 access_token 鉴权，走全局代理配置
 - 无痕浏览器优先使用 playwright（注入 cookie 直达支付页）；未安装时降级为系统 Chrome/Edge 无痕模式
 - 安装完整支付功能：`pip install ".[payment]" && playwright install chromium`（可选）
