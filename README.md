@@ -304,6 +304,69 @@ docker-compose up -d
 
 服务启动后访问 http://localhost:8000
 
+### MicroWARP 代理池（可选）
+
+> 说明：该方案通过多容器实现不同出口 IP（**不持久化 WARP 账号**）。
+
+**一键启动（推荐）**
+
+```bash
+# 生成 MicroWARP 组合配置并启动全部服务
+./scripts/docker-up.sh
+```
+
+PowerShell：
+```powershell
+# 生成 MicroWARP 组合配置并启动全部服务
+./scripts/docker-up.ps1
+```
+
+**手动方式**
+
+```bash
+# 生成 MicroWARP 组合配置（默认端口范围 12001-12005，统一入口 1080）
+python scripts/generate_microwarp_compose.py
+
+# 启动（合并主 compose 与生成文件）
+docker compose -f docker-compose.yml -f docker-compose.microwarp.generated.yml up -d
+```
+
+可配置环境变量：
+- `WARP_PORT_START`：端口范围起始（默认 12001）
+- `WARP_PORT_END`：端口范围结束（默认 12005）
+- `WARP_FRONT_PORT`：统一入口端口（默认 1080，Windows 上建议用 10899）
+
+动态代理入口（轮询）：`socks5://127.0.0.1:${WARP_FRONT_PORT:-10899}`
+直连节点（端口范围）：`socks5://127.0.0.1:${WARP_PORT_START:-12001}~${WARP_PORT_END:-12005}`
+
+**动态代理（任务级轮询）**
+
+为了让“每次任务”切换端口，提供两种方式：
+
+**方式 A：本地直连（推荐）**
+- 代理 API 地址：`local://port-range`
+- API 密钥：留空
+- 密钥请求头：保持默认
+- JSON 字段路径：留空
+
+> 该方式不走 HTTP 请求，直接在进程内轮询端口范围，避免容器内访问 127.0.0.1 的问题。
+
+可通过环境变量覆盖：
+- `LOCAL_PROXY_HOST`（默认 127.0.0.1）
+- `LOCAL_PROXY_SCHEME`（默认 socks5）
+- `LOCAL_PROXY_PORT_RANGE`（默认 12001-12005）
+
+**方式 B：HTTP API**
+- API 地址：`http://127.0.0.1:8000/api/proxy/dynamic`
+- JSON 字段路径：`proxy`
+
+验证示例：
+```bash
+curl --socks5-hostname 127.0.0.1:${WARP_FRONT_PORT:-10899} https://1.1.1.1/cdn-cgi/trace
+curl --socks5-hostname 127.0.0.1:${WARP_PORT_START:-12001} https://1.1.1.1/cdn-cgi/trace
+curl http://127.0.0.1:8000/api/proxy/dynamic
+```
+
 ### 配置说明
 
 **端口映射**：默认 `8000` 端口，可在 `docker-compose.yml` 中修改。
