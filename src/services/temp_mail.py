@@ -21,6 +21,7 @@ from ..config.constants import OTP_CODE_PATTERN
 
 
 logger = logging.getLogger(__name__)
+EMAIL_ADDRESS_PATTERN = r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"
 
 
 class TempMailService(BaseEmailService):
@@ -245,6 +246,12 @@ class TempMailService(BaseEmailService):
                 raise
             raise EmailServiceError(f"请求失败: {method} {path} - {e}")
 
+    def _strip_email_addresses(self, text: str) -> str:
+        """移除正文中的邮箱地址，避免将邮箱数字误判为验证码。"""
+        if not text:
+            return ""
+        return re.sub(EMAIL_ADDRESS_PATTERN, " ", text)
+
     def create_email(self, config: Dict[str, Any] = None) -> Dict[str, Any]:
         """
         通过 admin API 创建临时邮箱
@@ -368,12 +375,13 @@ class TempMailService(BaseEmailService):
                     body_text = parsed["body"]
                     raw_text = parsed["raw"]
                     content = f"{sender}\n{subject}\n{body_text}\n{raw_text}".strip()
+                    safe_content = self._strip_email_addresses(content)
 
                     # 只处理 OpenAI 邮件
                     if "openai" not in sender and "openai" not in content.lower():
                         continue
 
-                    match = re.search(pattern, content)
+                    match = re.search(pattern, safe_content)
                     if match:
                         code = match.group(1)
                         logger.info(f"从 TempMail 邮箱 {email} 找到验证码: {code}")
