@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import time
 import logging
 import uuid
 from typing import Any, List, Optional
@@ -592,6 +593,11 @@ async def trigger_auto_registration(count: int, cpa_service_id: int):
 
 _is_checking = False
 _is_checking_401 = False
+_pending_check_once = False
+_pending_check_lock = threading.Lock()
+_check_abort_requested = False
+_check_abort_lock = threading.Lock()
+_last_config_trigger_ts = 0.0
 _auto_register_batch_ids = set()
 _auto_register_batch_lock = threading.Lock()
 
@@ -623,6 +629,57 @@ def cancel_auto_register_batches() -> int:
         except Exception:
             continue
     return cancelled
+
+def _mark_pending_check_once() -> bool:
+    """标记在当前检查任务结束后再补跑一次检查。"""
+    global _pending_check_once
+    with _pending_check_lock:
+        if _pending_check_once:
+            return False
+        _pending_check_once = True
+        return True
+
+
+def _consume_pending_check_once() -> bool:
+    """消费一次待执行的检查请求。"""
+    global _pending_check_once
+    with _pending_check_lock:
+        if not _pending_check_once:
+            return False
+        _pending_check_once = False
+        return True
+
+
+def _request_abort_check() -> None:
+    global _check_abort_requested
+    with _check_abort_lock:
+        _check_abort_requested = True
+
+
+def _consume_abort_check() -> bool:
+    global _check_abort_requested
+    with _check_abort_lock:
+        if not _check_abort_requested:
+            return False
+        _check_abort_requested = False
+        return True
+
+
+def _should_abort_check() -> bool:
+    with _check_abort_lock:
+        return _check_abort_requested
+
+
+def request_cpa_check_once(main_loop, reason: str = "config") -> None:
+    """请求立即执行一次 CPA 检查（若正在运行则排队一次）。"""
+    global _last_config_trigger_ts
+    now = time.time()
+    # 防止短时间重复触发导致多次补跑
+    if now - _last_config_trigger_ts < 3:
+        append_system_log("warning", "检测任务保存过于频繁，已合并触发请求")
+        return
+    _last_config_trigger_ts = now
+    check_cpa_services_job(main_loop, None, allow_queue=True, reason=reason)
 
 def check_cpa_services_401_job(main_loop, manual_logs: list = None, force: bool = False):
     """快速检查并剔除面板标记 401/403 的凭证（不做测活）"""
@@ -710,7 +767,12 @@ def check_cpa_services_401_job(main_loop, manual_logs: list = None, force: bool 
     finally:
         _is_checking_401 = False
 
-def check_cpa_services_job(main_loop, manual_logs: list = None):
+def check_cpa_services_job(
+    main_loop,
+    manual_logs: list = None,
+    allow_queue: bool = False,
+    reason: str = "scheduler",
+):
     """定时检查所有启用的 CPA 服务"""
     global _is_checking
     settings = get_settings()
@@ -718,11 +780,17 @@ def check_cpa_services_job(main_loop, manual_logs: list = None):
         return
 
     if _is_checking:
-        msg = "当前已有一个检查任务在运行，本次并发请求将被跳过。"
-        if manual_logs is not None:
-            manual_logs.append(f"[WARNING] {msg}")
-            # only inject system log if triggered manually to not pollute too much
+        if allow_queue and manual_logs is None:
+            _request_abort_check()
+            queued = _mark_pending_check_once()
+            msg = "检测任务运行中，已请求中止并重启以应用新配置。" if queued else "检测任务运行中，已存在重启请求，已合并。"
             append_system_log("warning", msg)
+        else:
+            msg = "当前已有一个检查任务在运行，本次并发请求将被跳过。"
+            if manual_logs is not None:
+                manual_logs.append(f"[WARNING] {msg}")
+                # only inject system log if triggered manually to not pollute too much
+                append_system_log("warning", msg)
         return
         
     _is_checking = True
@@ -741,6 +809,12 @@ def check_cpa_services_job(main_loop, manual_logs: list = None):
             if not services:
                 _log("警告：当前没有任何启用的 CPA 服务！请先配置并启用 CPA 服务。", "warning")
             for svc in services:
+                aborted = False
+                if _should_abort_check():
+                    _consume_abort_check()
+                    _log("检测任务收到中止请求，准备重启以应用新配置。", "warning")
+                    aborted = True
+                    break
                 valid_count = 0
                 fetch_success = False
                 check_failed = False
@@ -824,6 +898,8 @@ def check_cpa_services_job(main_loop, manual_logs: list = None):
                         total_files = len(files)
                         
                         def _test_item(item, index, total):
+                            if _should_abort_check():
+                                return True, None
                             name = str(item.get("name", "")).strip()
                             if not name:
                                 return False, None
@@ -862,6 +938,12 @@ def check_cpa_services_job(main_loop, manual_logs: list = None):
                                         # Cancel pending futures
                                         for f in futures: f.cancel()
                                         return
+                                    if _should_abort_check():
+                                        _consume_abort_check()
+                                        _log("检测任务收到中止请求，终止后续测活并准备重启。", "warning")
+                                        for f in futures: f.cancel()
+                                        aborted = True
+                                        break
                                     futures.append(executor.submit(_test_item, item, i, total_files))
                                 
                                 for future in as_completed(futures):
@@ -871,7 +953,8 @@ def check_cpa_services_job(main_loop, manual_logs: list = None):
                                     elif deleted_name:
                                         with invalid_count_lock: invalid_count += 1
                                         
-                        _log(f"CPA 服务 {svc.name} 检查完成，有效: {valid_count}，剔除: {invalid_count}")
+                        if not aborted:
+                            _log(f"CPA 服务 {svc.name} 检查完成，有效: {valid_count}，剔除: {invalid_count}")
                     
                 except Exception as e:
                     _log(f"检查 CPA 服务 {svc.id} ({svc.name}) 异常/鉴权失败: {e}", 'error')
@@ -879,6 +962,8 @@ def check_cpa_services_job(main_loop, manual_logs: list = None):
                     valid_count = 0
                     check_failed = True
 
+                if aborted:
+                    break
                 # 无论检查成功还是失败，只要启用自动补充且 valid_count < threshold 就补货
                 if settings.cpa_auto_register_enabled:
                     if check_failed:
@@ -910,6 +995,11 @@ def check_cpa_services_job(main_loop, manual_logs: list = None):
         _log(f"定时检查 CPA 任务异常: {e}", 'error')
     finally:
         _is_checking = False
+
+    if manual_logs is None and _consume_pending_check_once():
+        if get_settings().cpa_auto_check_enabled:
+            _log("检测任务因配置更新请求将立即再次执行", "warning")
+            check_cpa_services_job(main_loop, None, allow_queue=False, reason="pending")
 
 
 async def _scheduler_loop():

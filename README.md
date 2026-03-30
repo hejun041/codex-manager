@@ -27,6 +27,7 @@ AI 站长交流群：https://t.me/vpsbbq
     - **TempMail**：自部署 Cloudflare Worker 临时邮箱，配置 Worker 地址 + Admin 密码
   - DuckMail
     - **DuckMail API**：兼容 DuckMail 接口，手动填写 API 地址、默认域名，可选 API Key
+  - 支持**多选邮箱服务轮询**，自动在所选服务间分配请求，降低单服务 429 风险
 
 - **注册模式**
   - 单次注册

@@ -86,9 +86,9 @@ async def update_cpa_scheduler_config(request: CPASchedulerConfig, background_ta
     
     # 若启用了自动任务，保存后立刻在后台触发一次体检及补充，而不必等待下一个定时周期
     if request.check_enabled:
-        from ...core.scheduler import check_cpa_services_job
+        from ...core.scheduler import request_cpa_check_once
         loop = asyncio.get_event_loop()
-        background_tasks.add_task(loop.run_in_executor, None, check_cpa_services_job, loop, None)
+        background_tasks.add_task(loop.run_in_executor, None, request_cpa_check_once, loop, "config")
 
     return {"success": True, "message": "定时任务配置已保存"}
 
