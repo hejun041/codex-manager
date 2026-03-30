@@ -6,6 +6,7 @@ from typing import Any, List, Optional
 from datetime import datetime
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 from curl_cffi import requests as cffi_requests
 
@@ -57,6 +58,48 @@ def _extract_cliproxy_account_id(item: dict) -> Optional[str]:
         val = id_token.get("chatgpt_account_id")
         if val:
             return str(val)
+    return None
+
+
+def _coerce_status_code(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            return int(text)
+    return None
+
+
+def _extract_cliproxy_status_code(item: Any) -> Optional[int]:
+    if not isinstance(item, dict):
+        return None
+
+    for key in (
+        "status_code",
+        "statusCode",
+        "http_status",
+        "httpStatus",
+        "last_status_code",
+        "lastStatusCode",
+        "last_http_status",
+        "lastHttpStatus",
+    ):
+        code = _coerce_status_code(item.get(key))
+        if code is not None:
+            return code
+
+    for key in ("status_message", "statusMessage", "last_status", "lastStatus", "error"):
+        nested = item.get(key)
+        if isinstance(nested, dict):
+            for inner_key in ("status_code", "statusCode", "http_status", "httpStatus", "code"):
+                code = _coerce_status_code(nested.get(inner_key))
+                if code is not None:
+                    return code
     return None
 
 
@@ -466,6 +509,8 @@ def check_cpa_services_job(main_loop, manual_logs: list = None):
             for svc in services:
                 valid_count = 0
                 fetch_success = False
+                check_failed = False
+                files: List[dict] = []
                 try:
                     _log(f"检查 CPA 服务: {svc.name}")
                     files, total_count, skipped_count = fetch_cliproxy_auth_files(svc.api_url, svc.api_token)
@@ -484,6 +529,36 @@ def check_cpa_services_job(main_loop, manual_logs: list = None):
                             f"CPA 服务 {svc.name} 获取到 {total_count} 个凭证，"
                             f"筛选后保留 {len(files)} 个 Codex 凭证，跳过 {skipped_count} 个"
                         )
+
+                        removed_401 = 0
+                        if settings.cpa_auto_check_remove_401:
+                            remaining_files = []
+                            for item in files:
+                                status_code = _extract_cliproxy_status_code(item)
+                                if status_code == 401:
+                                    name = str(item.get("name", "")).strip()
+                                    if not name:
+                                        _log("检测到面板标记 401 的凭证但缺少名称，已跳过快速剔除", 'warning')
+                                        remaining_files.append(item)
+                                        continue
+                                    if not _is_cpa_codex_auth_file(item):
+                                        _log(f"面板标记 401 的凭证 {name} 非 Codex，按策略仅跳过不清理", 'warning')
+                                        remaining_files.append(item)
+                                        continue
+                                    try:
+                                        delete_cliproxy_auth_file(name, svc.api_url, svc.api_token)
+                                        removed_401 += 1
+                                        _log(f"面板 401 快速剔除: {name}", 'warning')
+                                        continue
+                                    except Exception as e:
+                                        _log(f"面板 401 快速剔除 {name} 失败: {e}", 'error')
+                                        remaining_files.append(item)
+                                        continue
+                                remaining_files.append(item)
+
+                            if removed_401 > 0:
+                                _log(f"面板 401 快速剔除完成，已剔除 {removed_401} 个，剩余待测 {len(remaining_files)} 个")
+                            files = remaining_files
                         
                         has_triggered_early = False
                         if settings.cpa_auto_register_enabled:
@@ -502,8 +577,14 @@ def check_cpa_services_job(main_loop, manual_logs: list = None):
                                     except Exception as e:
                                         _log(f"调度早间补偿任务失败: {e}", 'error')
                         
-                        _log(f"开始并发穿透测试这 {len(files)} 个凭证的健康状态，最大并发数: {settings.global_concurrency}，请耐心等待...")
-                        invalid_count = 0
+                        if not files:
+                            if removed_401 > 0:
+                                _log(f"CPA 服务 {svc.name} 401 快速剔除后无剩余凭证待测", 'warning')
+                            else:
+                                _log(f"CPA 服务 {svc.name} 暂无可测凭证", 'warning')
+                        else:
+                            _log(f"开始并发穿透测试这 {len(files)} 个凭证的健康状态，最大并发数: {settings.global_concurrency}，请耐心等待...")
+                        invalid_count = removed_401
                         valid_count_lock = threading.Lock()
                         invalid_count_lock = threading.Lock()
                         total_files = len(files)
@@ -538,33 +619,37 @@ def check_cpa_services_job(main_loop, manual_logs: list = None):
                                 _log(f"测活进度 [{index}/{total}]: 测试凭证 {name} 报错 ({e})", 'error')
                                 return True, None
 
-                        import threading
-                        with ThreadPoolExecutor(max_workers=settings.global_concurrency) as executor:
-                            futures = []
-                            for i, item in enumerate(files, 1):
-                                if not get_settings().cpa_auto_check_enabled and manual_logs is None:
-                                    _log("任务参数已被手动修改为停止，中止并退出当前检查...", 'warning')
-                                    # Cancel pending futures
-                                    for f in futures: f.cancel()
-                                    return
-                                futures.append(executor.submit(_test_item, item, i, total_files))
-                            
-                            for future in as_completed(futures):
-                                is_valid, deleted_name = future.result()
-                                if is_valid:
-                                    with valid_count_lock: valid_count += 1
-                                elif deleted_name:
-                                    with invalid_count_lock: invalid_count += 1
-                                    
+                        if files:
+                            with ThreadPoolExecutor(max_workers=settings.global_concurrency) as executor:
+                                futures = []
+                                for i, item in enumerate(files, 1):
+                                    if not get_settings().cpa_auto_check_enabled and manual_logs is None:
+                                        _log("任务参数已被手动修改为停止，中止并退出当前检查...", 'warning')
+                                        # Cancel pending futures
+                                        for f in futures: f.cancel()
+                                        return
+                                    futures.append(executor.submit(_test_item, item, i, total_files))
+                                
+                                for future in as_completed(futures):
+                                    is_valid, deleted_name = future.result()
+                                    if is_valid:
+                                        with valid_count_lock: valid_count += 1
+                                    elif deleted_name:
+                                        with invalid_count_lock: invalid_count += 1
+                                        
                         _log(f"CPA 服务 {svc.name} 检查完成，有效: {valid_count}，剔除: {invalid_count}")
                     
                 except Exception as e:
                     _log(f"检查 CPA 服务 {svc.id} ({svc.name}) 异常/鉴权失败: {e}", 'error')
                     _log(f"无法正确访问接通接口，为保障供应，视为其剩余有效凭证数量为 0", "warning")
                     valid_count = 0
+                    check_failed = True
 
                 # 无论检查成功还是失败，只要启用自动补充且 valid_count < threshold 就补货
                 if settings.cpa_auto_register_enabled:
+                    if check_failed:
+                        _log(f"CPA 服务 {svc.name} 本次检查失败，已跳过自动注册判断", "warning")
+                        continue
                     # 如果之前因为总数不够已经触发过了，就不要重复触发了
                     if fetch_success and len(files) < settings.cpa_auto_register_threshold:
                         pass

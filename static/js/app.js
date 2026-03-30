@@ -95,6 +95,7 @@ const elements = {
     tmServiceSelect: document.getElementById('tm-service-select'),
     // 定时 CPA
     cpaAutoCheckEnabled: document.getElementById('cpa-auto-check-enabled'),
+    cpaAutoRemove401: document.getElementById('cpa-auto-remove-401'),
     cpaTestUrl: document.getElementById('cpa-test-url'),
     cpaTestModel: document.getElementById('cpa-test-model'),
     cpaCheckInterval: document.getElementById('cpa-check-interval'),
@@ -124,6 +125,7 @@ async function loadSchedulerConfig() {
     try {
         const config = await api.get('/scheduler/config');
         if (elements.cpaAutoCheckEnabled) elements.cpaAutoCheckEnabled.checked = config.check_enabled;
+        if (elements.cpaAutoRemove401) elements.cpaAutoRemove401.checked = !!config.check_remove_401;
         if (elements.cpaTestUrl) elements.cpaTestUrl.value = config.test_url || '';
         if (elements.cpaTestModel) elements.cpaTestModel.value = config.test_model || '';
         if (elements.cpaCheckInterval) elements.cpaCheckInterval.value = config.check_interval;
@@ -275,6 +277,7 @@ async function handleSaveSchedulerConfig() {
     try {
         await api.post('/scheduler/config', {
             check_enabled: elements.cpaAutoCheckEnabled.checked,
+            check_remove_401: elements.cpaAutoRemove401 ? elements.cpaAutoRemove401.checked : false,
             check_interval: parseInt(elements.cpaCheckInterval.value) || 60,
             check_sleep: parseInt(elements.cpaCheckSleep.value) || 0,
             check_min_remaining_weekly_percent: parseInt(elements.cpaCheckMinRemainingWeeklyPercent.value) || 0,
@@ -303,6 +306,7 @@ async function handleStopSchedulerTask() {
     try {
         await api.post('/scheduler/config', {
             check_enabled: false,
+            check_remove_401: elements.cpaAutoRemove401 ? elements.cpaAutoRemove401.checked : false,
             check_interval: parseInt(elements.cpaCheckInterval.value) || 60,
             check_sleep: parseInt(elements.cpaCheckSleep.value) || 0,
             check_min_remaining_weekly_percent: parseInt(elements.cpaCheckMinRemainingWeeklyPercent.value) || 0,
