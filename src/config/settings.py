@@ -354,6 +354,12 @@ SETTING_DEFINITIONS: Dict[str, SettingDefinition] = {
         category=SettingCategory.CPA,
         description="是否启用定时检查并剔除失效 CPA 凭证"
     ),
+    "cpa_auto_check_remove_401": SettingDefinition(
+        db_key="cpa.auto_check_remove_401",
+        default_value=False,
+        category=SettingCategory.CPA,
+        description="是否直接剔除面板标记为 401 的凭证（跳过测活）"
+    ),
     "cpa_auto_check_interval": SettingDefinition(
         db_key="cpa.auto_check_interval",
         default_value=60,
@@ -473,6 +479,7 @@ SETTING_TYPES: Dict[str, Type] = {
     "tm_enabled": bool,
     "cpa_enabled": bool,
     "cpa_auto_check_enabled": bool,
+    "cpa_auto_check_remove_401": bool,
     "cpa_auto_check_interval": int,
     "cpa_auto_check_sleep_seconds": int,
     "cpa_auto_check_min_remaining_weekly_percent": int,
@@ -767,6 +774,7 @@ class Settings(BaseModel):
     cpa_api_url: str = ""
     cpa_api_token: SecretStr = SecretStr("")
     cpa_auto_check_enabled: bool = False
+    cpa_auto_check_remove_401: bool = False
     cpa_auto_check_interval: int = 60
     cpa_auto_check_sleep_seconds: int = 1
     cpa_auto_check_min_remaining_weekly_percent: int = 20
