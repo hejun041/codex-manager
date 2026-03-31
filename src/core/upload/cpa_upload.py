@@ -120,6 +120,15 @@ def _resolve_account_id(account: Account) -> str:
     )
 
 
+def _resolve_user_agent(account: Account) -> str:
+    extra = account.extra_data
+    if isinstance(extra, dict):
+        ua = extra.get("user_agent") or extra.get("ua")
+        if isinstance(ua, str) and ua.strip():
+            return ua.strip()
+    return ""
+
+
 def generate_token_json(account: Account) -> dict:
     """
     生成 CPA 格式的 Token JSON
@@ -131,11 +140,13 @@ def generate_token_json(account: Account) -> dict:
         CPA 格式的 Token 字典
     """
     account_id = _resolve_account_id(account)
-    return {
+    user_agent = _resolve_user_agent(account)
+    id_token = account.id_token or account.access_token or ""
+    token = {
         "type": "codex",
         "email": account.email,
         "expired": account.expires_at.strftime("%Y-%m-%dT%H:%M:%S+08:00") if account.expires_at else "",
-        "id_token": account.id_token or "",
+        "id_token": id_token,
         "account_id": account_id or "",
         "chatgpt_account_id": account_id or "",
         "chatgptAccountId": account_id or "",
@@ -143,6 +154,10 @@ def generate_token_json(account: Account) -> dict:
         "last_refresh": account.last_refresh.strftime("%Y-%m-%dT%H:%M:%S+08:00") if account.last_refresh else "",
         "refresh_token": account.refresh_token or "",
     }
+    if user_agent:
+        token["user_agent"] = user_agent
+        token["headers"] = {"User-Agent": user_agent}
+    return token
 
 
 def upload_to_cpa(
