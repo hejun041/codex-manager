@@ -222,10 +222,15 @@ class UpdateService:
             base_root = self._normalize_self_update_path(Path.cwd())
             parts = list(work_root.parts)
             if base_root.name == "self_update":
+                if parts[:2] == ["data", "self_update"] or parts[:1] == ["self_update"]:
+                    work_root = base_root
+                else:
+                    work_root = base_root / work_root
+            elif base_root.name == "data":
                 if parts[:2] == ["data", "self_update"]:
-                    work_root = base_root
+                    work_root = base_root.parent / work_root
                 elif parts[:1] == ["self_update"]:
-                    work_root = base_root
+                    work_root = base_root / work_root
                 else:
                     work_root = base_root / work_root
             else:

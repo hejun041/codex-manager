@@ -812,7 +812,7 @@ class Settings(BaseModel):
 
     # 应用信息
     app_name: str = "OpenAI/Codex CLI 自动注册系统"
-    app_version: str = "2.0.9"
+    app_version: str = "2.0.10"
     debug: bool = False
 
     # 数据库配置
