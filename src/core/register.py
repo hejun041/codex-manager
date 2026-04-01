@@ -570,25 +570,79 @@ class RegistrationEngine:
 
     def register(self, email: str, password: str, sentinel_token: str = None):
         url = f"{self.AUTH}/api/accounts/user/register"
-        headers = {"Content-Type": "application/json", "Accept": "application/json",
-                    "Referer": f"{self.AUTH}/create-account/password", "Origin": self.AUTH}
-        headers.update(_make_trace_headers())
-        if sentinel_token: headers["openai-sentinel-token"] = sentinel_token
-        r = self._request_with_retry(
-            "post",
-            url,
-            label="Register",
-            json={"username": email, "password": password},
-            headers=headers,
-        )
-        if r is None:
-            return 0, {"error": "register_request_failed"}
-        try:
-            data = r.json()
-        except Exception:
-            data = {"text": r.text[:500]}
-        self._log(f"Register -> {r.status_code}")
-        return r.status_code, data
+        base_headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Referer": f"{self.AUTH}/create-account/password",
+            "Origin": self.AUTH,
+        }
+        transient_gateway_statuses = {502, 503, 504, 520, 521, 522, 523, 524, 525, 526}
+        max_gateway_retries = 2
+        current_sentinel_token = sentinel_token
+
+        for attempt in range(1, max_gateway_retries + 2):
+            headers = dict(base_headers)
+            headers.update(_make_trace_headers())
+            if current_sentinel_token:
+                headers["openai-sentinel-token"] = current_sentinel_token
+
+            r = self._request_with_retry(
+                "post",
+                url,
+                label="Register",
+                json={"username": email, "password": password},
+                headers=headers,
+            )
+            if r is None:
+                if attempt <= max_gateway_retries:
+                    self._log(
+                        f"Register 请求失败，准备重试 ({attempt}/{max_gateway_retries})",
+                        "warning",
+                    )
+                    time.sleep(min(1.2 * attempt, 3.0))
+                    fresh_sentinel = build_sentinel_token(
+                        self.session,
+                        self.device_id,
+                        flow="authorize_continue",
+                        user_agent=self.ua,
+                        sec_ch_ua=self.sec_ch_ua,
+                        impersonate=self.impersonate,
+                    )
+                    if fresh_sentinel:
+                        current_sentinel_token = fresh_sentinel
+                    continue
+                return 0, {"error": "register_request_failed"}
+
+            try:
+                data = r.json()
+            except Exception:
+                data = {"text": r.text[:500]}
+            self._log(f"Register -> {r.status_code}")
+
+            if r.status_code not in transient_gateway_statuses:
+                return r.status_code, data
+
+            if attempt <= max_gateway_retries:
+                self._log(
+                    f"Register 命中网关错误 HTTP {r.status_code}，准备重试 ({attempt}/{max_gateway_retries})",
+                    "warning",
+                )
+                time.sleep(min(1.2 * attempt, 3.0))
+                fresh_sentinel = build_sentinel_token(
+                    self.session,
+                    self.device_id,
+                    flow="authorize_continue",
+                    user_agent=self.ua,
+                    sec_ch_ua=self.sec_ch_ua,
+                    impersonate=self.impersonate,
+                )
+                if fresh_sentinel:
+                    current_sentinel_token = fresh_sentinel
+                continue
+
+            return r.status_code, data
+
+        return 0, {"error": "register_request_failed"}
 
     def send_otp(self):
         self._otp_sent_at = time.time()

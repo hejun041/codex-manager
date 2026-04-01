@@ -700,3 +700,40 @@ def test_extract_workspace_id_from_html_supports_value_before_name():
     """
     workspace_id = engine._extract_workspace_id_from_html(html_text)
     assert workspace_id == "ws-order-1"
+
+
+def test_register_retries_on_transient_502_and_succeeds(monkeypatch):
+    session = QueueSession([
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["register"],
+            DummyResponse(status_code=502, text="<html>bad gateway</html>"),
+        ),
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["register"],
+            DummyResponse(status_code=200, payload={}),
+        ),
+    ])
+    engine = RegistrationEngine(FakeEmailService(["123456"]))
+    engine.session = session
+    engine.device_id = "device-1"
+    engine.ua = "ua-test"
+    engine.sec_ch_ua = '"Chromium";v="136"'
+    engine.impersonate = "chrome136"
+
+    monkeypatch.setattr("src.core.register.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("src.core.register.build_sentinel_token", lambda *args, **kwargs: "sentinel-refreshed")
+
+    status, data = engine.register(
+        email="tester@example.com",
+        password="pass-1234",
+        sentinel_token="sentinel-initial",
+    )
+
+    assert status == 200
+    assert data == {}
+    first_headers = session.calls[0]["kwargs"]["headers"]
+    second_headers = session.calls[1]["kwargs"]["headers"]
+    assert first_headers.get("openai-sentinel-token") == "sentinel-initial"
+    assert second_headers.get("openai-sentinel-token") == "sentinel-refreshed"
