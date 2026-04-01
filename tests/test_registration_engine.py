@@ -452,15 +452,16 @@ def test_oauth_login_flow_rate_limited_stops_immediately(monkeypatch):
     assert sleep_calls == [5]
 
 
-def test_oauth_submit_consent_form_supports_button_without_type_and_html_navigation():
+def test_oauth_submit_consent_form_skips_consent_post_and_uses_api_continue_url():
     session = QueueSession([
         (
             "POST",
-            "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            OPENAI_API_ENDPOINTS["signup"],
             DummyResponse(
                 status_code=200,
-                text='<html><script>window.location="/oauth/authorize/resume?flow=1"</script></html>',
-                url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+                payload={"continue_url": "https://auth.openai.com/oauth/authorize/resume?flow=1"},
+                text='{"continue_url":"https://auth.openai.com/oauth/authorize/resume?flow=1"}',
+                url=OPENAI_API_ENDPOINTS["signup"],
             ),
         ),
         (
@@ -490,23 +491,13 @@ def test_oauth_submit_consent_form_supports_button_without_type_and_html_navigat
     )
 
     assert code == "code-consent-1"
-    post_data = session.calls[0]["kwargs"]["data"]
-    assert post_data["csrf_token"] == "csrf-1"
-    assert post_data["decision"] == "allow"
-    assert "action" not in post_data
+    assert session.calls[0]["url"] == OPENAI_API_ENDPOINTS["signup"]
+    api_payload = json.loads(session.calls[0]["kwargs"]["data"])
+    assert api_payload == {}
 
 
 def test_oauth_submit_consent_form_falls_back_to_authorize_continue_api():
     session = QueueSession([
-        (
-            "POST",
-            "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
-            DummyResponse(
-                status_code=200,
-                text="<html>consent</html>",
-                url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
-            ),
-        ),
         (
             "POST",
             OPENAI_API_ENDPOINTS["signup"],
@@ -544,8 +535,8 @@ def test_oauth_submit_consent_form_falls_back_to_authorize_continue_api():
     )
 
     assert code == "code-consent-2"
-    api_data = json.loads(session.calls[1]["kwargs"]["data"])
-    assert api_data["action"] == "default"
+    api_data = json.loads(session.calls[0]["kwargs"]["data"])
+    assert api_data == {}
 
 
 def test_oauth_submit_consent_form_sets_default_action_for_authorize_continue_form():
@@ -594,6 +585,24 @@ def test_oauth_exchange_auth_code_visits_oauth_authorize_entry_first():
         ),
         (
             "GET",
+            "https://chatgpt.com/api/auth/session",
+            DummyResponse(
+                status_code=401,
+                text='{"error":"unauthorized"}',
+                url="https://chatgpt.com/api/auth/session",
+            ),
+        ),
+        (
+            "GET",
+            "https://auth.openai.com/api/auth/session",
+            DummyResponse(
+                status_code=401,
+                text='{"error":"unauthorized"}',
+                url="https://auth.openai.com/api/auth/session",
+            ),
+        ),
+        (
+            "GET",
             "https://auth.openai.com/sign-in-with-chatgpt/codex/consent?flow=abc",
             DummyResponse(
                 status_code=302,
@@ -622,6 +631,24 @@ def test_oauth_exchange_auth_code_uses_workspace_id_from_consent_html():
             DummyResponse(
                 status_code=302,
                 headers={"Location": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent?flow=xyz"},
+            ),
+        ),
+        (
+            "GET",
+            "https://chatgpt.com/api/auth/session",
+            DummyResponse(
+                status_code=401,
+                text='{"error":"unauthorized"}',
+                url="https://chatgpt.com/api/auth/session",
+            ),
+        ),
+        (
+            "GET",
+            "https://auth.openai.com/api/auth/session",
+            DummyResponse(
+                status_code=401,
+                text='{"error":"unauthorized"}',
+                url="https://auth.openai.com/api/auth/session",
             ),
         ),
         (
@@ -689,6 +716,48 @@ def test_extract_navigation_url_skips_static_asset_and_prefers_auth_url():
     assert nav_url == "https://auth.openai.com/oauth/authorize/resume?flow=1"
 
 
+def test_extract_redirect_from_html_supports_chrome_error_reload_url():
+    engine = RegistrationEngine(FakeEmailService(["123456"]))
+    html_text = """
+    <button id="reload-button" data-url="http://localhost:1455/auth/callback?code=ac_test_1&amp;scope=openid&amp;state=state-1"></button>
+    <script>
+      var loadTimeDataRaw = {
+        "reloadUrl":"http://localhost:1455/auth/callback?code=ac_test_1\\u0026scope=openid\\u0026state=state-1"
+      };
+    </script>
+    """
+    callback_url = engine._extract_redirect_from_html(
+        html_text,
+        "http://localhost:1455/auth/callback",
+    )
+    assert callback_url is not None
+    assert "code=ac_test_1" in callback_url
+    assert "state=state-1" in callback_url
+
+
+def test_oauth_follow_and_extract_code_supports_chrome_error_reload_url():
+    session = QueueSession([
+        (
+            "GET",
+            "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            DummyResponse(
+                status_code=200,
+                text=(
+                    '<button id="reload-button" '
+                    'data-url="http://localhost:1455/auth/callback?code=code-html-1&amp;state=state-1"></button>'
+                ),
+                url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            ),
+        ),
+    ])
+    engine = RegistrationEngine(FakeEmailService(["123456"]))
+    code = engine._oauth_follow_and_extract_code(
+        session,
+        "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+    )
+    assert code == "code-html-1"
+
+
 def test_extract_workspace_id_from_html_supports_value_before_name():
     engine = RegistrationEngine(FakeEmailService(["123456"]))
     html_text = """
@@ -722,6 +791,18 @@ def test_extract_workspace_id_from_html_supports_workspaces_array():
     """
     workspace_id = engine._extract_workspace_id_from_html(html_text)
     assert workspace_id == "ws-array-1"
+
+
+def test_extract_workspace_id_from_html_supports_escaped_bootstrap_payload():
+    engine = RegistrationEngine(FakeEmailService(["123456"]))
+    ws_id = "5cddda31-082a-45fc-8ca2-7f4b96d14a0a"
+    html_text = rf"""
+    <script id="bootstrap-inert-script" type="application/json">
+      {{"payload":"{{\\\"account\\\":{{\\\"id\\\":\\\"{ws_id}\\\"}}}}"}}
+    </script>
+    """
+    workspace_id = engine._extract_workspace_id_from_html(html_text)
+    assert workspace_id == ws_id
 
 
 def test_oauth_submit_consent_form_uses_workspace_from_cookie_when_html_missing():
@@ -769,12 +850,38 @@ def test_extract_workspace_id_from_cookie_supports_plain_json():
     assert workspace_id == "ws-json-1"
 
 
+def test_extract_workspace_id_from_cookie_supports_account_id_plain_json():
+    engine = RegistrationEngine(FakeEmailService(["123456"]))
+    ws_id = "5cddda31-082a-45fc-8ca2-7f4b96d14a0a"
+    raw_cookie = f'{{"account_id":"{ws_id}"}}'
+    workspace_id = engine._extract_workspace_id_from_cookie(raw_cookie)
+    assert workspace_id == ws_id
+
+
 def test_oauth_get_workspace_id_falls_back_to_authorize_url_page():
     oauth_auth_url = (
         "https://auth.openai.com/oauth/authorize?"
         "client_id=app_xxx&response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"
     )
     session = QueueSession([
+        (
+            "GET",
+            "https://chatgpt.com/api/auth/session",
+            DummyResponse(
+                status_code=401,
+                text='{"error":"unauthorized"}',
+                url="https://chatgpt.com/api/auth/session",
+            ),
+        ),
+        (
+            "GET",
+            "https://auth.openai.com/api/auth/session",
+            DummyResponse(
+                status_code=401,
+                text='{"error":"unauthorized"}',
+                url="https://auth.openai.com/api/auth/session",
+            ),
+        ),
         (
             "GET",
             oauth_auth_url,
@@ -794,6 +901,76 @@ def test_oauth_get_workspace_id_falls_back_to_authorize_url_page():
     )
 
     assert workspace_id == "ws-auth-1"
+
+
+def test_oauth_get_workspace_id_scans_all_cookie_names():
+    session = QueueSession([])
+    session.cookies["unified_session_manifest"] = '{"default_workspace_id":"ws-manifest-1"}'
+    engine = RegistrationEngine(FakeEmailService(["123456"]))
+
+    workspace_id = engine._oauth_get_workspace_id(
+        session=session,
+        probe_pages=False,
+    )
+
+    assert workspace_id == "ws-manifest-1"
+
+
+def test_oauth_get_workspace_id_falls_back_to_chatgpt_session_account_id():
+    ws_id = "5cddda31-082a-45fc-8ca2-7f4b96d14a0a"
+    session = QueueSession([
+        (
+            "GET",
+            "https://chatgpt.com/api/auth/session",
+            DummyResponse(
+                status_code=200,
+                payload={"account": {"id": ws_id}},
+                text=f'{{"account":{{"id":"{ws_id}"}}}}',
+                url="https://chatgpt.com/api/auth/session",
+            ),
+        ),
+    ])
+    engine = RegistrationEngine(FakeEmailService(["123456"]))
+
+    workspace_id = engine._oauth_get_workspace_id(
+        session=session,
+        probe_pages=False,
+    )
+
+    assert workspace_id == ws_id
+
+
+def test_oauth_get_workspace_id_falls_back_to_auth_session_account_id():
+    ws_id = "5cddda31-082a-45fc-8ca2-7f4b96d14a0a"
+    session = QueueSession([
+        (
+            "GET",
+            "https://chatgpt.com/api/auth/session",
+            DummyResponse(
+                status_code=401,
+                text='{"error":"unauthorized"}',
+                url="https://chatgpt.com/api/auth/session",
+            ),
+        ),
+        (
+            "GET",
+            "https://auth.openai.com/api/auth/session",
+            DummyResponse(
+                status_code=200,
+                payload={"account": {"id": ws_id}},
+                text=f'{{"account":{{"id":"{ws_id}"}}}}',
+                url="https://auth.openai.com/api/auth/session",
+            ),
+        ),
+    ])
+    engine = RegistrationEngine(FakeEmailService(["123456"]))
+
+    workspace_id = engine._oauth_get_workspace_id(
+        session=session,
+        probe_pages=False,
+    )
+
+    assert workspace_id == ws_id
 
 
 def test_oauth_select_workspace_accepts_redirect_location():
@@ -890,6 +1067,61 @@ def test_oauth_submit_authorize_continue_api_extracts_workspace_from_payload():
     )
 
     assert code == "code-api-ws-1"
+
+
+def test_oauth_submit_authorize_continue_api_refollows_authorize_when_body_empty():
+    authorize_url = (
+        "https://auth.openai.com/oauth/authorize?"
+        "client_id=app_xxx&response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"
+    )
+    session = QueueSession([
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["signup"],
+            DummyResponse(
+                status_code=200,
+                payload={},
+                text="{}",
+                url=OPENAI_API_ENDPOINTS["signup"],
+            ),
+        ),
+        (
+            "GET",
+            "https://chatgpt.com/api/auth/session",
+            DummyResponse(
+                status_code=401,
+                text='{"error":"unauthorized"}',
+                url="https://chatgpt.com/api/auth/session",
+            ),
+        ),
+        (
+            "GET",
+            "https://auth.openai.com/api/auth/session",
+            DummyResponse(
+                status_code=401,
+                text='{"error":"unauthorized"}',
+                url="https://auth.openai.com/api/auth/session",
+            ),
+        ),
+        (
+            "GET",
+            authorize_url,
+            DummyResponse(
+                status_code=302,
+                headers={"Location": "http://localhost:1455/auth/callback?code=code-api-empty-1&state=state-1"},
+            ),
+        ),
+    ])
+    engine = RegistrationEngine(FakeEmailService(["123456"]))
+
+    code = engine._oauth_submit_authorize_continue_api(
+        session=session,
+        page_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+        redirect_uri="http://localhost:1455/auth/callback",
+        authorize_url=authorize_url,
+    )
+
+    assert code == "code-api-empty-1"
 
 
 def test_oauth_login_flow_retries_otp_once_when_first_validate_fails(monkeypatch):

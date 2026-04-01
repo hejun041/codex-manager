@@ -8,6 +8,7 @@ import re
 import json
 import time
 import logging
+import os
 import secrets
 import string
 import random
@@ -97,12 +98,24 @@ def _generate_pkce():
     return code_verifier, code_challenge
 
 def _extract_code_from_url(url: str):
-    if not url or "code=" not in url:
+    if not url:
+        return None
+    normalized_url = html.unescape(str(url)).replace("\\u0026", "&").replace("&amp;", "&")
+    if "code=" not in normalized_url:
         return None
     try:
-        return parse_qs(urlparse(url).query).get("code", [None])[0]
+        code = parse_qs(urlparse(normalized_url).query).get("code", [None])[0]
+        if code:
+            return code
+    except Exception:
+        pass
+    try:
+        match = re.search(r"[?&]code=([^&#]+)", normalized_url)
+        if match:
+            return unquote(match.group(1))
     except Exception:
         return None
+    return None
 
 
 def _extract_account_id_from_jwt(token: str) -> str:
@@ -380,6 +393,44 @@ class RegistrationEngine:
             )
         except Exception:
             self.oauth_rate_limit_backoff_max_seconds = 60
+
+        def _env_bool(name: str, default: bool) -> bool:
+            raw = str(os.environ.get(name, "")).strip().lower()
+            if not raw:
+                return default
+            return raw in ("1", "true", "yes", "on")
+
+        def _env_int(name: str, default: int, minimum: int = 1, maximum: int = 20) -> int:
+            raw = str(os.environ.get(name, "")).strip()
+            if not raw:
+                return default
+            try:
+                return max(minimum, min(maximum, int(raw)))
+            except Exception:
+                return default
+
+        # OAuth 执行策略（默认精简，减少无效步骤和限流概率）
+        self.oauth_enable_session_reuse = _env_bool("OAUTH_ENABLE_SESSION_REUSE", False)
+        self.oauth_session_reuse_max_attempts = _env_int(
+            "OAUTH_SESSION_REUSE_MAX_ATTEMPTS",
+            1,
+            minimum=1,
+            maximum=6,
+        )
+        self.oauth_login_max_attempts = _env_int(
+            "OAUTH_LOGIN_MAX_ATTEMPTS",
+            2,
+            minimum=1,
+            maximum=6,
+        )
+        self.oauth_enable_redirect_chain_fallback = _env_bool(
+            "OAUTH_ENABLE_REDIRECT_CHAIN_FALLBACK",
+            False,
+        )
+        self.oauth_enable_legacy_consent_payloads = _env_bool(
+            "OAUTH_ENABLE_LEGACY_CONSENT_PAYLOADS",
+            False,
+        )
 
     def _log(self, message: str, level: str = "info"):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -845,10 +896,79 @@ class RegistrationEngine:
                     return html.unescape(match.group(1))
         return None
 
+    def _extract_callback_url_from_html(self, text: str, redirect_uri: str = "") -> Optional[str]:
+        """从 HTML（含浏览器错误页脚本）提取 localhost 回调 URL。"""
+        if not text:
+            return None
+
+        def _normalize(candidate: str) -> str:
+            value = html.unescape(str(candidate or "")).strip()
+            value = value.replace("\\u0026", "&").replace("\\/", "/").replace("&amp;", "&")
+            try:
+                for _ in range(2):
+                    decoded = unquote(value)
+                    if decoded == value:
+                        break
+                    value = decoded
+            except Exception:
+                pass
+            value = value.strip(" \"'")
+            return value
+
+        def _redirect_match(candidate: str) -> bool:
+            if not redirect_uri:
+                return True
+            if candidate.startswith(redirect_uri):
+                return True
+            try:
+                c = urlparse(candidate)
+                r = urlparse(redirect_uri)
+                return (
+                    (c.scheme or "").lower() == (r.scheme or "").lower()
+                    and (c.netloc or "").lower() == (r.netloc or "").lower()
+                    and (c.path or "") == (r.path or "")
+                )
+            except Exception:
+                return False
+
+        patterns = (
+            r'data-url=["\']([^"\']*auth/callback[^"\']*)["\']',
+            r'"reloadUrl"\s*:\s*"([^"]*auth/callback[^"]*)"',
+            r"https?://localhost(?::\d+)?/auth/callback[^\s\"'<>]+",
+            r"/auth/callback\?[^\"'<>\\s]+",
+            r"https?%3A%2F%2Flocalhost(?:%3A\d+)?%2Fauth%2Fcallback[^\\s\"'<>]+",
+        )
+
+        for pattern in patterns:
+            for match in re.findall(pattern, text, flags=re.IGNORECASE):
+                candidate = _normalize(match)
+                if not candidate:
+                    continue
+                if candidate.startswith("/auth/callback"):
+                    try:
+                        base = urlparse(redirect_uri) if redirect_uri else None
+                        if base and base.scheme and base.netloc:
+                            candidate = f"{base.scheme}://{base.netloc}{candidate}"
+                        else:
+                            candidate = f"http://localhost:1455{candidate}"
+                    except Exception:
+                        candidate = f"http://localhost:1455{candidate}"
+                if not candidate.lower().startswith("http"):
+                    continue
+                if not _extract_code_from_url(candidate):
+                    continue
+                if _redirect_match(candidate):
+                    return candidate
+        return None
+
     def _extract_redirect_from_html(self, text: str, redirect_uri: str) -> Optional[str]:
         """从 HTML 中抽取回调地址（meta refresh / window.location / 链接）。"""
         if not text:
             return None
+
+        callback_from_error_page = self._extract_callback_url_from_html(text, redirect_uri)
+        if callback_from_error_page:
+            return callback_from_error_page
 
         patterns = (
             r'http-equiv=["\']refresh["\']\s+content=["\']\d+;\s*url=([^"\']+)["\']',
@@ -859,13 +979,140 @@ class RegistrationEngine:
         for pattern in patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
-                candidate = html.unescape(match.group(1))
+                candidate = (
+                    html.unescape(match.group(1) or "")
+                    .replace("\\u0026", "&")
+                    .replace("&amp;", "&")
+                    .replace("\\/", "/")
+                )
                 if candidate.startswith(redirect_uri):
                     return candidate
 
         for match in re.findall(r"https?://[^\s\"'>]+", text):
-            if match.startswith(redirect_uri):
-                return match
+            candidate = (
+                html.unescape(match or "")
+                .replace("\\u0026", "&")
+                .replace("&amp;", "&")
+                .replace("\\/", "/")
+            )
+            if candidate.startswith(redirect_uri):
+                return candidate
+
+        return None
+
+    def _extract_oauth_code_from_callback_cookie(self, raw_value: str, redirect_uri: str = "") -> Optional[str]:
+        """从 callback 类 Cookie 值中提取 OAuth code。"""
+        if not raw_value:
+            return None
+
+        candidates: list[str] = []
+
+        def _push(value: Any) -> None:
+            text = str(value or "").strip()
+            if not text:
+                return
+            if text in candidates:
+                return
+            candidates.append(text)
+
+        _push(raw_value)
+        try:
+            decoded = unquote(str(raw_value))
+            if decoded:
+                _push(decoded)
+        except Exception:
+            pass
+
+        for candidate in list(candidates):
+            value = str(candidate or "").strip().strip("\"'")
+            if not value:
+                continue
+            _push(value)
+
+            # 尝试多轮解码（兼容 URL 编码层层嵌套）
+            try:
+                collapsed = value
+                for _ in range(2):
+                    decoded = unquote(collapsed)
+                    if decoded == collapsed:
+                        break
+                    collapsed = decoded
+                    _push(collapsed)
+            except Exception:
+                pass
+
+            # 兼容只存了相对回调路径 /auth/callback?... 的场景
+            if value.startswith("/auth/callback"):
+                try:
+                    base = urlparse(redirect_uri) if redirect_uri else None
+                    if base and base.scheme and base.netloc:
+                        _push(f"{base.scheme}://{base.netloc}{value}")
+                    else:
+                        _push(f"http://localhost:1455{value}")
+                except Exception:
+                    _push(f"http://localhost:1455{value}")
+
+            code = _extract_code_from_url(value)
+            if code:
+                return code
+
+            # 兼容 JSON 字符串（如 {"url":"http://localhost..."}）
+            if value.startswith("{") or value.startswith("["):
+                try:
+                    payload = json.loads(value)
+                except Exception:
+                    payload = None
+                if isinstance(payload, dict):
+                    for key in ("url", "callback_url", "callbackUrl", "redirect_url", "redirectUrl", "href"):
+                        nested = str(payload.get(key) or "").strip()
+                        if not nested:
+                            continue
+                        nested_code = _extract_code_from_url(nested)
+                        if nested_code:
+                            return nested_code
+
+        return None
+
+    def _extract_oauth_code_from_session_cookies(
+        self,
+        session: cffi_requests.Session,
+        redirect_uri: str = "",
+    ) -> Optional[str]:
+        """从会话 Cookie 中提取 OAuth code（优先 callback-url）。"""
+        preferred_cookie_names = (
+            "__Secure-next-auth.callback-url",
+            "__secure-next-auth.callback-url",
+            "next-auth.callback-url",
+            "__Host-next-auth.callback-url",
+        )
+
+        for cookie_name in preferred_cookie_names:
+            for raw_cookie in self._extract_cookie_values(session, cookie_name):
+                code = self._extract_oauth_code_from_callback_cookie(raw_cookie, redirect_uri)
+                if code:
+                    self._log(f"从 Cookie {cookie_name} 提取到 OAuth code", "info")
+                    return code
+
+        # 兜底：遍历全部 Cookie，筛选 callback/redirect 相关名称
+        try:
+            jar = getattr(session.cookies, "jar", None)
+            if jar is None:
+                return None
+            for item in list(jar):
+                name = str(getattr(item, "name", "") or "").strip().lower()
+                if not name:
+                    continue
+                if "callback" not in name and "redirect" not in name:
+                    continue
+                raw_value = str(getattr(item, "value", "") or "").strip()
+                if not raw_value:
+                    continue
+                code = self._extract_oauth_code_from_callback_cookie(raw_value, redirect_uri)
+                if code:
+                    self._log(f"从 Cookie {name} 提取到 OAuth code", "info")
+                    return code
+        except Exception:
+            return None
 
         return None
 
@@ -973,9 +1220,13 @@ class RegistrationEngine:
         """从 HTML 中提取前端跳转 URL（允许非 redirect_uri 前缀）。"""
         if not text:
             return None
+        callback_url = self._extract_callback_url_from_html(text, self.oauth_redirect_uri)
+        if callback_url:
+            return callback_url
 
         def _normalize(candidate: str) -> str:
             value = html.unescape(candidate or "").strip()
+            value = value.replace("\\u0026", "&").replace("\\/", "/").replace("&amp;", "&")
             if not value:
                 return ""
             if value.startswith("/") and base_url:
@@ -1049,48 +1300,185 @@ class RegistrationEngine:
 
         return None
 
+    def _iter_workspace_search_texts(self, text: str) -> list[str]:
+        """生成用于 workspace_id 提取的候选文本（含解码与 bootstrap 脚本）。"""
+        if not text:
+            return []
+        candidates: list[str] = []
+
+        def _push(value: str) -> None:
+            value = str(value or "")
+            if not value:
+                return
+            if value in candidates:
+                return
+            candidates.append(value)
+
+        _push(text)
+        try:
+            _push(html.unescape(text))
+        except Exception:
+            pass
+
+        # 提取 bootstrap 脚本内容并做多层轻量解码
+        try:
+            bootstrap_blocks = re.findall(
+                r'<script[^>]+id=["\']bootstrap-inert-script["\'][^>]*>(.*?)</script>',
+                text,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+        except Exception:
+            bootstrap_blocks = []
+
+        for block in bootstrap_blocks:
+            _push(block)
+            try:
+                unescaped = html.unescape(block)
+                _push(unescaped)
+                _push(unescaped.replace(r"\/", "/").replace(r"\\u0026", "&"))
+                _push(unescaped.replace('\\"', '"'))
+                collapsed = unescaped
+                for _ in range(3):
+                    next_collapsed = (
+                        collapsed
+                        .replace(r'\\\"', r'\"')
+                        .replace(r"\\\\u0026", r"\u0026")
+                        .replace(r"\\\\/", r"\\/")
+                    )
+                    if next_collapsed == collapsed:
+                        break
+                    collapsed = next_collapsed
+                    _push(collapsed)
+                try:
+                    parsed = json.loads(unescaped.strip())
+                except Exception:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    _push(json.dumps(parsed, ensure_ascii=False))
+                    for value in parsed.values():
+                        if isinstance(value, str):
+                            _push(value)
+                            _push(value.replace('\\"', '"'))
+            except Exception:
+                pass
+
+        return candidates
+
     def _extract_workspace_id_from_html(self, text: str) -> Optional[str]:
         """从 consent 页面 HTML 中提取 workspace_id。"""
         if not text:
             return None
+        patterns = (
+            r'name=["\']workspace_id["\'][^>]*value=["\']([^"\']+)["\']',
+            r'value=["\']([^"\']+)["\'][^>]*name=["\']workspace_id["\']',
+            r'"workspace_id"\s*:\s*"([^"]+)"',
+            r'"workspaceId"\s*:\s*"([^"]+)"',
+            r'"default_workspace_id"\s*:\s*"([^"]+)"',
+            r'"defaultWorkspaceId"\s*:\s*"([^"]+)"',
+            r'"workspaces"\s*:\s*\[\s*\{\s*"id"\s*:\s*"([^"]+)"',
+            r'"workspaces"\s*:\s*\[[^\]]*?"id"\s*:\s*"([^"]+)"',
+            r'"workspace"\s*:\s*\{[^\}]*?"id"\s*:\s*"([^"]+)"',
+            r'"account"\s*:\s*\{[^\}]*?"id"\s*:\s*"([0-9a-fA-F-]{8,})"',
+            r'"chatgpt_account_id"\s*:\s*"([0-9a-fA-F-]{8,})"',
+            r'workspace_id=([0-9a-fA-F-]{8,})',
+            # 兼容 bootstrap 脚本中被转义的 JSON 文本
+            r'\\"workspace_id\\"\s*:\s*\\"([^\\"]+)\\"',
+            r'\\"workspaceId\\"\s*:\s*\\"([^\\"]+)\\"',
+            r'\\"default_workspace_id\\"\s*:\s*\\"([^\\"]+)\\"',
+            r'\\"defaultWorkspaceId\\"\s*:\s*\\"([^\\"]+)\\"',
+            r'\\"workspaces\\"\s*:\s*\[[^\]]*?\\"id\\"\s*:\s*\\"([^\\"]+)\\"',
+            r'\\"workspace\\"\s*:\s*\{[^\}]*?\\"id\\"\s*:\s*\\"([^\\"]+)\\"',
+            r'\\"account\\"\s*:\s*\{[^\}]*?\\"id\\"\s*:\s*\\"([0-9a-fA-F-]{8,})\\"',
+            r'\\"chatgpt_account_id\\"\s*:\s*\\"([0-9a-fA-F-]{8,})\\"',
+        )
         try:
-            patterns = (
-                r'name=["\']workspace_id["\'][^>]*value=["\']([^"\']+)["\']',
-                r'value=["\']([^"\']+)["\'][^>]*name=["\']workspace_id["\']',
-                r'"workspace_id"\s*:\s*"([^"]+)"',
-                r'"workspaceId"\s*:\s*"([^"]+)"',
-                r'"default_workspace_id"\s*:\s*"([^"]+)"',
-                r'"defaultWorkspaceId"\s*:\s*"([^"]+)"',
-                r'"workspaces"\s*:\s*\[\s*\{\s*"id"\s*:\s*"([^"]+)"',
-                r'"workspaces"\s*:\s*\[[^\]]*?"id"\s*:\s*"([^"]+)"',
-                r'"workspace"\s*:\s*\{[^\}]*?"id"\s*:\s*"([^"]+)"',
-                r'workspace_id=([0-9a-fA-F-]{8,})',
-            )
-            for pattern in patterns:
-                match = re.search(pattern, text, flags=re.IGNORECASE)
-                if not match:
-                    continue
-                workspace_id = str(html.unescape(match.group(1) or "")).strip()
-                if workspace_id:
-                    return workspace_id
+            for candidate_text in self._iter_workspace_search_texts(text):
+                for pattern in patterns:
+                    match = re.search(pattern, candidate_text, flags=re.IGNORECASE)
+                    if not match:
+                        continue
+                    workspace_id = str(html.unescape(match.group(1) or "")).strip()
+                    if workspace_id:
+                        return workspace_id
         except Exception:
             return None
         return None
 
     def _extract_workspace_id_from_payload(self, payload: Any) -> Optional[str]:
         """从 authorize/continue 等 JSON 响应里递归提取 workspace_id。"""
+        uuid_pattern = r"^[0-9a-fA-F-]{8,}$"
         if isinstance(payload, dict):
-            direct = str(payload.get("workspace_id") or payload.get("workspaceId") or "").strip()
-            if direct:
-                return direct
+            direct_keys = (
+                "workspace_id",
+                "workspaceId",
+                "default_workspace_id",
+                "defaultWorkspaceId",
+                "selected_workspace_id",
+                "selectedWorkspaceId",
+                "active_workspace_id",
+                "activeWorkspaceId",
+                "chatgpt_account_id",
+                "chatgptAccountId",
+                "account_id",
+                "accountId",
+                "default_account_id",
+                "defaultAccountId",
+            )
+            for key in direct_keys:
+                direct = str(payload.get(key) or "").strip()
+                if not direct:
+                    continue
+                if "workspace" in key.lower():
+                    return direct
+                if re.match(uuid_pattern, direct):
+                    return direct
+            account = payload.get("account")
+            if isinstance(account, dict):
+                account_id = str(account.get("id") or "").strip()
+                if account_id and re.match(uuid_pattern, account_id):
+                    return account_id
+            user = payload.get("user")
+            if isinstance(user, dict):
+                user_id = str(user.get("id") or "").strip()
+                if user_id and re.match(uuid_pattern, user_id):
+                    return user_id
             workspaces = payload.get("workspaces")
             if isinstance(workspaces, list):
                 for item in workspaces:
                     if isinstance(item, dict):
-                        ws_id = str(item.get("id") or item.get("workspace_id") or "").strip()
+                        ws_id = str(
+                            item.get("id")
+                            or item.get("workspace_id")
+                            or item.get("workspaceId")
+                            or ""
+                        ).strip()
                         if ws_id:
                             return ws_id
+            organizations = payload.get("organizations") or payload.get("orgs")
+            if isinstance(organizations, list):
+                for org in organizations:
+                    if isinstance(org, dict):
+                        org_ws_id = str(
+                            org.get("workspace_id")
+                            or org.get("workspaceId")
+                            or org.get("default_workspace_id")
+                            or org.get("defaultWorkspaceId")
+                            or ""
+                        ).strip()
+                        if org_ws_id:
+                            return org_ws_id
             for value in payload.values():
+                if isinstance(value, str):
+                    v = value.strip()
+                    if v and v[0] in "{[":
+                        try:
+                            nested = json.loads(v)
+                        except Exception:
+                            nested = None
+                        if nested is not None:
+                            ws_id = self._extract_workspace_id_from_payload(nested)
+                            if ws_id:
+                                return ws_id
                 ws_id = self._extract_workspace_id_from_payload(value)
                 if ws_id:
                     return ws_id
@@ -1107,9 +1495,12 @@ class RegistrationEngine:
         page_url: str,
         redirect_uri: str,
         workspace_id_hint: str = "",
+        authorize_url: str = "",
     ) -> Optional[str]:
         """Consent 兜底：调用 authorize/continue API 后继续提取 code。"""
-        payload_candidates = ({"action": "default"}, {"action": "accept"}, {})
+        payload_candidates = ({},)
+        if self.oauth_enable_legacy_consent_payloads:
+            payload_candidates = ({}, {"action": "accept"}, {"action": "default"})
         sentinel_header = self._oauth_login_sentinel or ""
         for payload in payload_candidates:
             try:
@@ -1132,6 +1523,10 @@ class RegistrationEngine:
                 continue
 
             self._log(f"Consent API 兜底状态: {resp.status_code} (payload={payload})")
+
+            cookie_code = self._extract_oauth_code_from_session_cookies(session, redirect_uri=redirect_uri)
+            if cookie_code:
+                return cookie_code
 
             if resp.status_code in (301, 302, 303, 307, 308):
                 loc = resp.headers.get("Location", "")
@@ -1161,8 +1556,9 @@ class RegistrationEngine:
                     text=response_text,
                     stage="OAuth Consent API 兜底",
                 )
+                payload_workspace_id = ""
                 if not continue_url:
-                    payload_workspace_id = self._extract_workspace_id_from_payload(resp_data)
+                    payload_workspace_id = self._extract_workspace_id_from_payload(resp_data) or ""
                     if payload_workspace_id:
                         self._log(f"Consent API 兜底提取到 workspace_id: {payload_workspace_id}")
                         ws_continue_url = self._oauth_select_workspace(session, payload_workspace_id)
@@ -1170,6 +1566,49 @@ class RegistrationEngine:
                             code = self._oauth_follow_and_extract_code(session, ws_continue_url)
                             if code:
                                 return code
+                    if not payload_workspace_id:
+                        live_workspace_id = (
+                            self._oauth_get_workspace_id(
+                                session,
+                                consent_url=page_url,
+                                authorize_url=authorize_url,
+                                probe_pages=False,
+                            )
+                            or workspace_id_hint
+                        )
+                        if live_workspace_id:
+                            self._log(f"Consent API 空响应后提取到 workspace_id: {live_workspace_id}")
+                            ws_continue_url = self._oauth_select_workspace(session, live_workspace_id)
+                            if ws_continue_url:
+                                code = self._oauth_follow_and_extract_code(session, ws_continue_url)
+                                if code:
+                                    return code
+
+                        # 有些场景 authorize/consent 会在当前会话下再次跳转出 code，这里补一次同会话回跳
+                        follow_candidates = [u for u in (authorize_url, page_url) if u]
+                        for candidate_url in follow_candidates:
+                            code = self._oauth_follow_and_extract_code(session, candidate_url)
+                            if code:
+                                self._log("Consent API 空响应后通过回跳链提取到授权码")
+                                return code
+                        if authorize_url:
+                            try:
+                                auto_resp = session.get(
+                                    authorize_url,
+                                    allow_redirects=True,
+                                    timeout=20,
+                                )
+                                code = _extract_code_from_url(str(auto_resp.url))
+                                if not code and getattr(auto_resp, "history", None):
+                                    for hist in auto_resp.history:
+                                        code = _extract_code_from_url(hist.headers.get("Location", ""))
+                                        if code:
+                                            break
+                                if code:
+                                    self._log("Consent API 空响应后通过自动重定向提取到授权码")
+                                    return code
+                            except Exception:
+                                pass
 
             if continue_url:
                 next_url = continue_url if continue_url.startswith("http") else f"{self.oauth_issuer}{continue_url}"
@@ -1195,6 +1634,10 @@ class RegistrationEngine:
                 if code:
                     return code
 
+            cookie_code = self._extract_oauth_code_from_session_cookies(session, redirect_uri=redirect_uri)
+            if cookie_code:
+                return cookie_code
+
         return None
 
     def _oauth_submit_consent_form(
@@ -1203,6 +1646,7 @@ class RegistrationEngine:
         page_url: str,
         html_text: str,
         redirect_uri: str,
+        authorize_url: str = "",
     ) -> Optional[str]:
         """提交 OAuth 同意页表单，提取授权码。"""
         try:
@@ -1292,13 +1736,13 @@ class RegistrationEngine:
             if "workspace_id" not in payload and workspace_id_hint:
                 payload["workspace_id"] = workspace_id_hint
 
-            if "/sign-in-with-chatgpt/codex/consent" in action_path and workspace_id_hint:
-                self._log("Consent 检测到 workspace_id，优先走 workspace/select", "info")
-                ws_continue_url = self._oauth_select_workspace(session, workspace_id_hint)
-                if ws_continue_url:
-                    code = self._oauth_follow_and_extract_code(session, ws_continue_url)
-                    if code:
-                        return code
+            if "/sign-in-with-chatgpt/codex/consent" in action_path:
+                self._log("Consent 页面优先提交表单（模拟点击继续）")
+
+            # 某些场景 callback-url cookie 已提前写入 code，优先尝试直接提取
+            cookie_code = self._extract_oauth_code_from_session_cookies(session, redirect_uri=redirect_uri)
+            if cookie_code:
+                return cookie_code
 
             headers = {
                 "Content-Type": "application/x-www-form-urlencoded",
@@ -1330,6 +1774,16 @@ class RegistrationEngine:
                     code = self._oauth_follow_and_extract_code(session, ws_continue_url)
                     if code:
                         return code
+                # workspace/select 未拿到 code，再尝试 Consent API 兜底
+                api_fallback_code = self._oauth_submit_authorize_continue_api(
+                    session,
+                    page_url=page_url,
+                    redirect_uri=redirect_uri,
+                    workspace_id_hint=workspace_id_hint,
+                    authorize_url=authorize_url,
+                )
+                if api_fallback_code:
+                    return api_fallback_code
 
             if resp.status_code in (301, 302, 303, 307, 308):
                 loc = resp.headers.get("Location", "")
@@ -1355,11 +1809,16 @@ class RegistrationEngine:
                 if code:
                     return code
 
+            cookie_code = self._extract_oauth_code_from_session_cookies(session, redirect_uri=redirect_uri)
+            if cookie_code:
+                return cookie_code
+
             api_fallback_code = self._oauth_submit_authorize_continue_api(
                 session,
                 page_url=page_url,
                 redirect_uri=redirect_uri,
                 workspace_id_hint=workspace_id_hint,
+                authorize_url=authorize_url,
             )
             if api_fallback_code:
                 return api_fallback_code
@@ -1930,22 +2389,48 @@ class RegistrationEngine:
         if "." in raw_value:
             candidates.extend(str(raw_value).split("."))
 
-        # 先走轻量级正则提取，兼容非 JWT cookie 结构
-        raw_decoded_candidates = []
+        # 先走 URL 解码候选
+        raw_decoded_candidates: list[str] = []
         for item in candidates:
             try:
                 raw_decoded_candidates.append(unquote(str(item)))
             except Exception:
                 raw_decoded_candidates.append(str(item))
 
+        # 再追加 base64 解码候选（兼容非 JWT 的 base64-json cookie）
+        for item in list(raw_decoded_candidates):
+            value = str(item or "").strip().strip("\"'")
+            if not value:
+                continue
+            for candidate in (value, value.replace("-", "+").replace("_", "/")):
+                if not re.match(r"^[A-Za-z0-9+/=]+$", candidate):
+                    continue
+                try:
+                    pad = "=" * ((4 - (len(candidate) % 4)) % 4)
+                    decoded = base64.b64decode((candidate + pad).encode("ascii"), validate=False)
+                    decoded_text = decoded.decode("utf-8", errors="ignore").strip()
+                    if decoded_text and decoded_text not in raw_decoded_candidates:
+                        raw_decoded_candidates.append(decoded_text)
+                except Exception:
+                    continue
+
         regex_patterns = (
             r'"workspace_id"\s*:\s*"([^"]+)"',
             r'"workspaceId"\s*:\s*"([^"]+)"',
             r'"default_workspace_id"\s*:\s*"([^"]+)"',
             r'"defaultWorkspaceId"\s*:\s*"([^"]+)"',
+            r'"selected_workspace_id"\s*:\s*"([^"]+)"',
+            r'"selectedWorkspaceId"\s*:\s*"([^"]+)"',
+            r'"active_workspace_id"\s*:\s*"([^"]+)"',
+            r'"activeWorkspaceId"\s*:\s*"([^"]+)"',
             r'"workspaces"\s*:\s*\[[^\]]*?"id"\s*:\s*"([^"]+)"',
             r'"workspace"\s*:\s*\{[^\}]*?"id"\s*:\s*"([^"]+)"',
+            r'"account"\s*:\s*\{[^\}]*?"id"\s*:\s*"([0-9a-fA-F-]{8,})"',
+            r'"chatgpt_account_id"\s*:\s*"([0-9a-fA-F-]{8,})"',
+            r'"account_id"\s*:\s*"([0-9a-fA-F-]{8,})"',
+            r'"default_account_id"\s*:\s*"([0-9a-fA-F-]{8,})"',
             r'workspace_id=([0-9a-fA-F-]{8,})',
+            r'account_id=([0-9a-fA-F-]{8,})',
         )
         for candidate in raw_decoded_candidates:
             for pattern in regex_patterns:
@@ -1968,7 +2453,7 @@ class RegistrationEngine:
                 payload = json.loads(value)
             except Exception:
                 payload = None
-            if isinstance(payload, dict):
+            if isinstance(payload, (dict, list)):
                 ws_from_payload = self._extract_workspace_id_from_payload(payload)
                 if ws_from_payload:
                     return ws_from_payload
@@ -1989,6 +2474,15 @@ class RegistrationEngine:
                 workspace_id = str(payload.get(key) or "").strip()
                 if workspace_id:
                     return workspace_id
+            account = payload.get("account")
+            if isinstance(account, dict):
+                account_id = str(account.get("id") or "").strip()
+                if account_id and re.match(r"^[0-9a-fA-F-]{8,}$", account_id):
+                    return account_id
+
+            ws_from_payload = self._extract_workspace_id_from_payload(payload)
+            if ws_from_payload:
+                return ws_from_payload
 
         return None
 
@@ -2029,6 +2523,12 @@ class RegistrationEngine:
                     ws_id = self._extract_workspace_id_from_cookie(str(match))
                     if ws_id:
                         return ws_id
+
+            # 最后兜底：从全部 Set-Cookie 里抽值尝试解析
+            for _, value in re.findall(r"(?im)^set-cookie\s*:\s*([^=:\s]+)=([^;\n]+)", header_blob):
+                ws_id = self._extract_workspace_id_from_cookie(str(value))
+                if ws_id:
+                    return ws_id
         except Exception:
             return None
         return None
@@ -2055,6 +2555,114 @@ class RegistrationEngine:
                     if workspace_id:
                         self._log(f"Workspace ID: {workspace_id} (from {cookie_name})")
                         return workspace_id
+            # 兼容新版 cookie 键名变更（如 unified_session_manifest/auth-session-minimized）
+            try:
+                seen_pairs = set()
+                cookies_obj = getattr(session, "cookies", None)
+                if cookies_obj is not None:
+                    if hasattr(cookies_obj, "items"):
+                        for name, raw_cookie in list(cookies_obj.items()):
+                            name_str = str(name or "").strip()
+                            value_str = str(raw_cookie or "").strip()
+                            if not value_str:
+                                continue
+                            pair = (name_str, value_str)
+                            if pair in seen_pairs:
+                                continue
+                            seen_pairs.add(pair)
+                            workspace_id = self._extract_workspace_id_from_cookie(value_str)
+                            if workspace_id:
+                                self._log(f"Workspace ID: {workspace_id} (from cookie:{name_str or 'unknown'})")
+                                return workspace_id
+                    jar = getattr(cookies_obj, "jar", None)
+                    if jar is not None:
+                        for item in list(jar):
+                            name_str = str(getattr(item, "name", "") or "").strip()
+                            value_str = str(getattr(item, "value", "") or "").strip()
+                            if not value_str:
+                                continue
+                            pair = (name_str, value_str)
+                            if pair in seen_pairs:
+                                continue
+                            seen_pairs.add(pair)
+                            workspace_id = self._extract_workspace_id_from_cookie(value_str)
+                            if workspace_id:
+                                self._log(f"Workspace ID: {workspace_id} (from cookie:{name_str or 'unknown'})")
+                                return workspace_id
+            except Exception:
+                pass
+
+            # 从 chatgpt 会话接口回捞 workspace（通常等于 account.id）
+            try:
+                resp_session = session.get(
+                    f"{self.BASE}/api/auth/session",
+                    headers={
+                        "accept": "application/json",
+                        "referer": f"{self.BASE}/",
+                    },
+                    timeout=15,
+                )
+                ws_from_headers = self._extract_workspace_id_from_response_headers(resp_session.headers)
+                if ws_from_headers:
+                    self._log(f"Workspace ID: {ws_from_headers} (from chatgpt session headers)")
+                    return ws_from_headers
+                if resp_session.status_code == 200 and (resp_session.text or "").strip():
+                    try:
+                        session_payload = resp_session.json()
+                    except Exception:
+                        session_payload = {}
+                    ws_from_payload = self._extract_workspace_id_from_payload(session_payload)
+                    if ws_from_payload:
+                        self._log(f"Workspace ID: {ws_from_payload} (from chatgpt session payload)")
+                        return ws_from_payload
+                    access_token = str(
+                        (session_payload or {}).get("accessToken")
+                        or (session_payload or {}).get("access_token")
+                        or ""
+                    ).strip()
+                    if access_token:
+                        ws_from_jwt = _extract_account_id_from_jwt(access_token)
+                        if ws_from_jwt:
+                            self._log(f"Workspace ID: {ws_from_jwt} (from chatgpt session jwt)")
+                            return ws_from_jwt
+            except Exception:
+                pass
+
+            # 从 auth 域会话接口回捞 workspace（部分场景仅 auth 域有有效登录态）
+            try:
+                resp_auth_session = session.get(
+                    f"{self.AUTH}/api/auth/session",
+                    headers={
+                        "accept": "application/json",
+                        "referer": f"{self.AUTH}/log-in",
+                    },
+                    timeout=15,
+                )
+                ws_from_headers = self._extract_workspace_id_from_response_headers(resp_auth_session.headers)
+                if ws_from_headers:
+                    self._log(f"Workspace ID: {ws_from_headers} (from auth session headers)")
+                    return ws_from_headers
+                if resp_auth_session.status_code == 200 and (resp_auth_session.text or "").strip():
+                    try:
+                        auth_session_payload = resp_auth_session.json()
+                    except Exception:
+                        auth_session_payload = {}
+                    ws_from_payload = self._extract_workspace_id_from_payload(auth_session_payload)
+                    if ws_from_payload:
+                        self._log(f"Workspace ID: {ws_from_payload} (from auth session payload)")
+                        return ws_from_payload
+                    access_token = str(
+                        (auth_session_payload or {}).get("accessToken")
+                        or (auth_session_payload or {}).get("access_token")
+                        or ""
+                    ).strip()
+                    if access_token:
+                        ws_from_jwt = _extract_account_id_from_jwt(access_token)
+                        if ws_from_jwt:
+                            self._log(f"Workspace ID: {ws_from_jwt} (from auth session jwt)")
+                            return ws_from_jwt
+            except Exception:
+                pass
 
             if not probe_pages:
                 return None
@@ -2095,8 +2703,19 @@ class RegistrationEngine:
                         if workspace_id:
                             self._log(f"Workspace ID: {workspace_id} (from page)")
                             return workspace_id
+                    bootstrap_len = 0
+                    try:
+                        bootstrap_match = re.search(
+                            r'<script[^>]+id=["\']bootstrap-inert-script["\'][^>]*>(.*?)</script>',
+                            response.text or "",
+                            flags=re.IGNORECASE | re.DOTALL,
+                        )
+                        if bootstrap_match:
+                            bootstrap_len = len(bootstrap_match.group(1) or "")
+                    except Exception:
+                        bootstrap_len = 0
                     page_debug.append(
-                        f"url={str(response.url)[:110]} status={response.status_code} text_len={len(response.text or '')}"
+                        f"url={str(response.url)[:110]} status={response.status_code} text_len={len(response.text or '')} bootstrap_len={bootstrap_len}"
                     )
                 except Exception:
                     page_debug.append(f"url={page_url[:110]} status=ERR")
@@ -2191,9 +2810,36 @@ class RegistrationEngine:
                 location = response.headers.get("Location") or ""
                 if response.status_code not in [301, 302, 303, 307, 308]:
                     self._log(f"非重定向状态码: {response.status_code}")
+                    callback_url = self._extract_redirect_from_html(
+                        response.text or "",
+                        self.oauth_redirect_uri,
+                    )
+                    if callback_url and _extract_code_from_url(callback_url):
+                        self._log(f"在页面源码中提取到回调 URL: {callback_url[:100]}...")
+                        return callback_url
+
+                    nav_url = self._extract_navigation_url_from_html(
+                        response.text or "",
+                        base_url=str(response.url),
+                    )
+                    if nav_url:
+                        code = _extract_code_from_url(nav_url)
+                        if code:
+                            self._log(f"在页面导航脚本中提取到回调 URL: {nav_url[:100]}...")
+                            return nav_url
+                        if nav_url != current_url:
+                            current_url = nav_url
+                            continue
                     break
                 if not location:
                     self._log("重定向响应缺少 Location 头")
+                    callback_url = self._extract_redirect_from_html(
+                        response.text or "",
+                        self.oauth_redirect_uri,
+                    )
+                    if callback_url and _extract_code_from_url(callback_url):
+                        self._log(f"在缺少 Location 的响应中提取到回调 URL: {callback_url[:100]}...")
+                        return callback_url
                     break
 
                 next_url = urljoin(current_url, location)
@@ -2214,6 +2860,9 @@ class RegistrationEngine:
         """跟随跳转链并提取 code（OAuth 授权流程兜底）。"""
         if not url:
             return None
+        cookie_code = self._extract_oauth_code_from_session_cookies(session, redirect_uri=self.oauth_redirect_uri)
+        if cookie_code:
+            return cookie_code
         current_url = url
         for _ in range(max_depth):
             if current_url.startswith("/"):
@@ -2225,6 +2874,9 @@ class RegistrationEngine:
                 m = re.search(r"(https?://localhost[^\s'\"]+)", str(e))
                 if m:
                     return _extract_code_from_url(m.group(1))
+                cookie_code = self._extract_oauth_code_from_session_cookies(session, redirect_uri=self.oauth_redirect_uri)
+                if cookie_code:
+                    return cookie_code
                 return None
 
             self._raise_if_phone_required(
@@ -2239,14 +2891,48 @@ class RegistrationEngine:
                 if code:
                     return code
                 if not loc:
+                    cookie_code = self._extract_oauth_code_from_session_cookies(session, redirect_uri=self.oauth_redirect_uri)
+                    if cookie_code:
+                        return cookie_code
                     return None
                 current_url = urljoin(current_url, loc)
                 continue
 
             if resp.status_code == 200:
-                return _extract_code_from_url(str(resp.url))
+                code = _extract_code_from_url(str(resp.url))
+                if code:
+                    return code
 
+                callback_url = self._extract_redirect_from_html(
+                    resp.text or "",
+                    self.oauth_redirect_uri,
+                )
+                code = _extract_code_from_url(callback_url or "")
+                if code:
+                    return code
+
+                nav_url = self._extract_navigation_url_from_html(
+                    resp.text or "",
+                    base_url=str(resp.url),
+                )
+                code = _extract_code_from_url(nav_url or "")
+                if code:
+                    return code
+                if nav_url and nav_url != current_url:
+                    current_url = nav_url
+                    continue
+                cookie_code = self._extract_oauth_code_from_session_cookies(session, redirect_uri=self.oauth_redirect_uri)
+                if cookie_code:
+                    return cookie_code
+                return None
+
+            cookie_code = self._extract_oauth_code_from_session_cookies(session, redirect_uri=self.oauth_redirect_uri)
+            if cookie_code:
+                return cookie_code
             return None
+        cookie_code = self._extract_oauth_code_from_session_cookies(session, redirect_uri=self.oauth_redirect_uri)
+        if cookie_code:
+            return cookie_code
         return None
 
     def _oauth_exchange_auth_code(self, session: cffi_requests.Session, oauth_start: OAuthStart) -> Optional[str]:
@@ -2290,22 +2976,7 @@ class RegistrationEngine:
             if m:
                 auth_code = _extract_code_from_url(m.group(1))
 
-        # 1) 直接访问 consent，看是否 302 带 code
-        #    先按参考项目思路：优先尝试直接拿 workspace_id -> workspace/select，绕开 consent 表单 405
-        if not auth_code:
-            early_workspace_id = self._oauth_get_workspace_id(
-                session,
-                consent_url=consent_url,
-                authorize_url=oauth_start.auth_url,
-                probe_pages=False,
-            )
-            if early_workspace_id:
-                self._log(f"提前提取到 workspace_id: {early_workspace_id}，优先走 workspace/select")
-                early_continue_url = self._oauth_select_workspace(session, early_workspace_id)
-                if early_continue_url:
-                    auth_code = self._oauth_follow_and_extract_code(session, early_continue_url)
-
-        # 2) 直接访问 consent，看是否 302 带 code
+        # 1) 直接访问 consent，优先模拟表单“继续”提交获取 code
         if not auth_code:
             try:
                 resp_consent = session.get(
@@ -2324,25 +2995,33 @@ class RegistrationEngine:
                     self._raise_if_phone_required(url=loc, stage="OAuth Consent(Location)")
                     auth_code = _extract_code_from_url(loc) or self._oauth_follow_and_extract_code(session, loc)
                 elif resp_consent.status_code == 200:
-                    consent_workspace_id = self._extract_workspace_id_from_html(resp_consent.text or "")
-                    if consent_workspace_id:
-                        self._log(f"Consent 页面提取到 workspace_id: {consent_workspace_id}")
-                        ws_continue_url = self._oauth_select_workspace(session, consent_workspace_id)
-                        if ws_continue_url:
-                            auth_code = self._oauth_follow_and_extract_code(session, ws_continue_url)
+                    auth_code = self._oauth_submit_consent_form(
+                        session,
+                        page_url=str(resp_consent.url),
+                        html_text=resp_consent.text or "",
+                        redirect_uri=oauth_start.redirect_uri,
+                        authorize_url=oauth_start.auth_url,
+                    )
                     if not auth_code:
-                        auth_code = self._oauth_submit_consent_form(
+                        consent_workspace_id = self._extract_workspace_id_from_html(resp_consent.text or "")
+                        if consent_workspace_id:
+                            self._log(f"Consent 页面提取到 workspace_id: {consent_workspace_id}")
+                            ws_continue_url = self._oauth_select_workspace(session, consent_workspace_id)
+                            if ws_continue_url:
+                                auth_code = self._oauth_follow_and_extract_code(session, ws_continue_url)
+                    if not auth_code:
+                        cookie_code = self._extract_oauth_code_from_session_cookies(
                             session,
-                            page_url=str(resp_consent.url),
-                            html_text=resp_consent.text or "",
                             redirect_uri=oauth_start.redirect_uri,
                         )
+                        if cookie_code:
+                            auth_code = cookie_code
             except Exception as e:
                 m = re.search(r"(https?://localhost[^\s'\"]+)", str(e))
                 if m:
                     auth_code = _extract_code_from_url(m.group(1))
 
-        # 3) 走 workspace / organization 流程
+        # 2) 走 workspace / organization 流程（仅在 Consent 表单路径失败后兜底）
         if not auth_code:
             workspace_id = self._oauth_get_workspace_id(
                 session,
@@ -2422,7 +3101,7 @@ class RegistrationEngine:
                 except Exception as e:
                     self._log(f"OAuth workspace/organization 处理异常: {e}", "warning")
 
-        # 4) 最后兜底：允许自动重定向
+        # 3) 最后兜底：允许自动重定向
         if not auth_code:
             try:
                 resp_fallback = session.get(
@@ -2486,7 +3165,7 @@ class RegistrationEngine:
                 scope="openid email profile offline_access",
                 proxy_url=self.proxy_url,
             )
-            max_attempts = 3
+            max_attempts = self.oauth_session_reuse_max_attempts
             for attempt in range(1, max_attempts + 1):
                 try:
                     self._oauth_wait_global_cooldown_if_needed()
@@ -2549,7 +3228,7 @@ class RegistrationEngine:
                 scope="openid email profile offline_access",
                 proxy_url=self.proxy_url,
             )
-            max_attempts = 3
+            max_attempts = self.oauth_login_max_attempts
             last_error = ""
             for attempt in range(1, max_attempts + 1):
                 try:
@@ -2651,18 +3330,21 @@ class RegistrationEngine:
 
                     auth_code = self._oauth_exchange_auth_code(session, oauth_start)
                     if not auth_code:
-                        self._log("未能从 OAuth consent 流程提取 code，尝试重定向链兜底", "warning")
-                        fallback_callback = self._oauth_follow_redirects(session, oauth_start.auth_url)
-                        if fallback_callback:
-                            token_info = self._oauth_handle_callback(
-                                oauth_manager,
-                                oauth_start,
-                                fallback_callback,
-                            )
-                            if token_info:
-                                self._oauth_session_token = session.cookies.get("__Secure-next-auth.session-token") or ""
-                                return token_info
-                        self._log("OAuth 重定向链兜底未提取到回调", "error")
+                        if self.oauth_enable_redirect_chain_fallback:
+                            self._log("未能从 OAuth consent 流程提取 code，尝试重定向链兜底", "warning")
+                            fallback_callback = self._oauth_follow_redirects(session, oauth_start.auth_url)
+                            if fallback_callback:
+                                token_info = self._oauth_handle_callback(
+                                    oauth_manager,
+                                    oauth_start,
+                                    fallback_callback,
+                                )
+                                if token_info:
+                                    self._oauth_session_token = session.cookies.get("__Secure-next-auth.session-token") or ""
+                                    return token_info
+                            self._log("OAuth 重定向链兜底未提取到回调", "error")
+                        else:
+                            self._log("未能从 OAuth consent 流程提取 code（已关闭重定向链兜底）", "warning")
                         last_error = "未能从 OAuth consent 流程提取 code"
                         continue
 
@@ -2701,12 +3383,14 @@ class RegistrationEngine:
     def get_oauth_tokens(self) -> Optional[Dict[str, Any]]:
         """通过 OAuth 授权获取 access_token/refresh_token。"""
         try:
-            self._log("OAuth 授权流程：优先复用现有会话获取 Token")
-            tokens = self._get_oauth_tokens_via_existing_session()
-            if tokens and tokens.get("access_token"):
-                return tokens
-
-            self._log("复用会话失败，回退旧版 OAuth 登录流程", "warning")
+            if self.oauth_enable_session_reuse:
+                self._log("OAuth 授权流程：优先复用现有会话获取 Token")
+                tokens = self._get_oauth_tokens_via_existing_session()
+                if tokens and tokens.get("access_token"):
+                    return tokens
+                self._log("复用会话失败，回退 OAuth 登录流程", "warning")
+            else:
+                self._log("OAuth 授权流程：已禁用复用会话，直接走 OAuth 登录流程")
             return self._get_oauth_tokens_via_login_flow()
         except Exception as e:
             self._log(f"OAuth 授权失败: {e}", "warning")

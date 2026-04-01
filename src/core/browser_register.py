@@ -1,17 +1,19 @@
-import time
+import json
 import logging
 import os
 import random
-import uuid
 import re
 import time
+import uuid
 from datetime import datetime
-from typing import Optional, Dict
-from urllib.parse import urlparse, parse_qs, urlencode
+from pathlib import Path
+from typing import Any, Dict, Optional
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from ..services.base import BaseEmailService
 from ..config.constants import generate_random_user_info, DEFAULT_PASSWORD_LENGTH, PASSWORD_CHARSET, OTP_CODE_PATTERN
 from .register import RegistrationResult
+from .utils import get_logs_dir
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +55,32 @@ class BrowserRegistrationEngine:
         self.auto_refresh_on_stuck = refresh_flag
         self.skip_oauth = skip_oauth_flag
         self.headless = headless_flag
+        save_elements_env = str(os.environ.get("BROWSER_SAVE_PAGE_ELEMENTS", "")).strip().lower()
+        if save_elements_env in ("1", "true", "yes", "on"):
+            page_dump_enabled = True
+        elif save_elements_env in ("0", "false", "no", "off"):
+            page_dump_enabled = False
+        else:
+            # 默认仅有头模式开启页面元素快照，便于排查 HTTP 模拟流程。
+            page_dump_enabled = not headless_flag
+        self.page_dump_enabled = page_dump_enabled
+        self.page_dump_include_screenshot = str(
+            os.environ.get("BROWSER_PAGE_DUMP_SCREENSHOT", "1")
+        ).lower() in ("1", "true", "yes", "on")
+        try:
+            self.page_dump_max_html_chars = max(
+                20_000, int(os.environ.get("BROWSER_PAGE_DUMP_MAX_HTML", "350000"))
+            )
+        except Exception:
+            self.page_dump_max_html_chars = 350_000
+        try:
+            self.page_dump_max_items = max(
+                20, min(1000, int(os.environ.get("BROWSER_PAGE_DUMP_MAX_ITEMS", "180")))
+            )
+        except Exception:
+            self.page_dump_max_items = 180
+        self.page_dump_dir: Optional[Path] = None
+        self._page_dump_index = 0
 
     def _debug_pause(self, page, reason: str):
         if not self.step_pause:
@@ -466,6 +494,195 @@ class BrowserRegistrationEngine:
         elif level == "warning": logger.warning(message)
         else: logger.info(message)
 
+    def _safe_dump_stage_name(self, stage: str) -> str:
+        name = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(stage or "page"))
+        name = name.strip("_")
+        if not name:
+            name = "page"
+        return name[:64]
+
+    def _prepare_page_dump_dir(self) -> Optional[Path]:
+        if not self.page_dump_enabled:
+            return None
+        if self.page_dump_dir is not None:
+            return self.page_dump_dir
+        try:
+            custom_dir = str(os.environ.get("BROWSER_PAGE_DUMP_DIR", "")).strip()
+            base_dir = Path(custom_dir) if custom_dir else (get_logs_dir() / "playwright_pages")
+            base_dir.mkdir(parents=True, exist_ok=True)
+
+            task_part = re.sub(r"[^a-zA-Z0-9_-]+", "", str(self.task_uuid or "manual"))[:24] or "manual"
+            run_part = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.page_dump_dir = base_dir / f"{run_part}_{task_part}_{uuid.uuid4().hex[:6]}"
+            self.page_dump_dir.mkdir(parents=True, exist_ok=True)
+            self._log(f"页面元素快照已启用，目录: {self.page_dump_dir}")
+            return self.page_dump_dir
+        except Exception as e:
+            self.page_dump_enabled = False
+            self._log(f"初始化页面快照目录失败: {e}", "warning")
+            return None
+
+    def _collect_page_elements(self, page) -> Dict[str, Any]:
+        max_items = int(self.page_dump_max_items or 120)
+        script = """
+        (maxItems) => {
+            const list = (selector) => Array.from(document.querySelectorAll(selector));
+            const txt = (el) => ((el.innerText || el.textContent || "").replace(/\\s+/g, " ").trim().slice(0, 140));
+            const attr = (el, key) => String(el.getAttribute(key) || "").slice(0, 180);
+            const visible = (el) => {
+                try {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+                } catch (_e) {
+                    return false;
+                }
+            };
+            const toInput = (el) => {
+                const type = String(el.type || el.getAttribute("type") || "").toLowerCase();
+                const rawValue = ("value" in el) ? String(el.value || "") : txt(el);
+                const value = type === "password" ? "<masked>" : rawValue.slice(0, 120);
+                return {
+                    tag: (el.tagName || "").toLowerCase(),
+                    type,
+                    name: attr(el, "name"),
+                    id: attr(el, "id"),
+                    placeholder: attr(el, "placeholder"),
+                    required: !!el.required,
+                    visible: visible(el),
+                    value,
+                    form_action: attr(el.closest("form") || document.createElement("form"), "action"),
+                };
+            };
+            const toButton = (el) => ({
+                tag: (el.tagName || "").toLowerCase(),
+                type: attr(el, "type"),
+                id: attr(el, "id"),
+                name: attr(el, "name"),
+                text: txt(el),
+                visible: visible(el),
+                form_action: attr(el.closest("form") || document.createElement("form"), "action"),
+            });
+            const toForm = (el) => ({
+                id: attr(el, "id"),
+                action: attr(el, "action"),
+                method: attr(el, "method"),
+                input_count: el.querySelectorAll("input, textarea, select").length,
+                button_count: el.querySelectorAll("button, input[type='submit'], input[type='button']").length,
+            });
+            const toLink = (el) => ({
+                text: txt(el),
+                href: attr(el, "href"),
+                visible: visible(el),
+            });
+            const hiddenInputs = list("input[type='hidden'][name]").slice(0, maxItems).map((el) => ({
+                name: attr(el, "name"),
+                id: attr(el, "id"),
+                value: String(el.value || "").slice(0, 180),
+            }));
+            return {
+                title: String(document.title || ""),
+                location: String(window.location.href || ""),
+                counts: {
+                    inputs: list("input, textarea, [contenteditable='true']").length,
+                    buttons: list("button, input[type='submit'], input[type='button'], [role='button']").length,
+                    forms: list("form").length,
+                    links: list("a[href]").length,
+                    iframes: list("iframe").length,
+                },
+                inputs: list("input, textarea, [contenteditable='true']").slice(0, maxItems).map(toInput),
+                buttons: list("button, input[type='submit'], input[type='button'], [role='button']").slice(0, maxItems).map(toButton),
+                forms: list("form").slice(0, maxItems).map(toForm),
+                links: list("a[href]").slice(0, maxItems).map(toLink),
+                hidden_inputs: hiddenInputs,
+                body_preview: ((document.body && document.body.innerText) || "").replace(/\\s+/g, " ").slice(0, 3000),
+            };
+        }
+        """
+        return page.evaluate(script, max_items) or {}
+
+    def _dump_page_state(self, page, stage: str, note: str = ""):
+        dump_dir = self._prepare_page_dump_dir()
+        if dump_dir is None:
+            return
+        try:
+            self._page_dump_index += 1
+            stage_name = self._safe_dump_stage_name(stage)
+            prefix = f"{self._page_dump_index:03d}_{stage_name}"
+
+            url_text = ""
+            try:
+                url_text = str(page.url or "")
+            except Exception:
+                url_text = ""
+
+            cookies = []
+            try:
+                cookies = [str(item.get("name") or "") for item in page.context.cookies()]
+            except Exception:
+                cookies = []
+
+            elements = {}
+            try:
+                elements = self._collect_page_elements(page)
+            except Exception as e:
+                elements = {"error": f"collect elements failed: {e}"}
+
+            html_text = ""
+            try:
+                html_text = page.content() or ""
+            except Exception as e:
+                html_text = f"<!-- failed to read html: {e} -->"
+            if len(html_text) > self.page_dump_max_html_chars:
+                html_text = html_text[: self.page_dump_max_html_chars] + "\n<!-- html truncated -->"
+
+            json_payload = {
+                "index": self._page_dump_index,
+                "stage": stage,
+                "note": note,
+                "captured_at": datetime.now().isoformat(),
+                "url": url_text,
+                "cookie_names": cookies,
+                "elements": elements,
+            }
+
+            json_path = dump_dir / f"{prefix}.json"
+            html_path = dump_dir / f"{prefix}.html"
+            json_path.write_text(json.dumps(json_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            html_path.write_text(html_text, encoding="utf-8")
+
+            if self.page_dump_include_screenshot:
+                try:
+                    page.screenshot(path=str(dump_dir / f"{prefix}.png"), full_page=True, timeout=15000)
+                except Exception:
+                    pass
+        except Exception as e:
+            self._log(f"保存页面快照失败({stage}): {e}", "warning")
+
+    def _bind_page_dump_events(self, page):
+        if not self.page_dump_enabled:
+            return
+
+        def _on_main_nav(frame):
+            try:
+                if frame != page.main_frame:
+                    return
+                nav_url = str(getattr(frame, "url", "") or "")
+                nav_path = ""
+                try:
+                    nav_path = (urlparse(nav_url).path or "").strip("/")
+                except Exception:
+                    nav_path = ""
+                stage = f"nav_{nav_path or 'root'}"
+                self._dump_page_state(page, stage)
+            except Exception:
+                return
+
+        try:
+            page.on("framenavigated", _on_main_nav)
+        except Exception as e:
+            self._log(f"绑定页面快照事件失败: {e}", "warning")
+
     def _generate_password(self, length: int = DEFAULT_PASSWORD_LENGTH) -> str:
         return ''.join(random.choices(PASSWORD_CHARSET, k=length))
 
@@ -505,7 +722,7 @@ class BrowserRegistrationEngine:
         birthdate = user_info['birthdate']
 
         browser_mode_label = "无头" if self.headless else "有头"
-        self._log(f"使用{browser_mode_label}浏览器注册，分配邮箱: {self.email}")
+        self._log(f"使用 Playwright 浏览器注册（{browser_mode_label}），分配邮箱: {self.email}")
         
         with sync_playwright() as p:
             launch_args = {
@@ -529,11 +746,15 @@ class BrowserRegistrationEngine:
             context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             page = context.new_page()
             refresh_state = {"count": 0}
+            self._prepare_page_dump_dir()
+            self._bind_page_dump_events(page)
+            self._dump_page_state(page, "startup")
             
             try:
                 self._log("访问 ChatGPT 首页获取验证环境...")
                 # 先访问首页，获取正常的 session 状态
                 page.goto("https://chatgpt.com/", wait_until="commit", timeout=60000)
+                self._dump_page_state(page, "home_loaded")
                 
                 try:
                     page.wait_for_selector('[data-testid="signup-button"], [data-testid="login-button"]', timeout=30000)
@@ -546,6 +767,7 @@ class BrowserRegistrationEngine:
                         page.locator('[data-testid="login-button"]').first.click(force=True)
                         
                     self._random_delay(2.0, 4.0)
+                    self._dump_page_state(page, "home_clicked_signup_or_login")
 
                     # 给前端一点缓冲时间，避免误判“卡住”
                     try:
@@ -563,18 +785,21 @@ class BrowserRegistrationEngine:
                             page.locator('[data-testid="signup-button"]').first.click(force=True)
                         elif page.locator('[data-testid="login-button"]').count() > 0:
                             page.locator('[data-testid="login-button"]').first.click(force=True)
+                        self._dump_page_state(page, "home_retry_click")
                 except Exception as e:
                     self._log(f"未找到首页按钮或操作异常: {e}", "warning")
                 
                 # 等待输入邮箱的界面
                 page.wait_for_selector("input[type='email']", timeout=60000)
                 self._random_delay(2.0, 4.0)
+                self._dump_page_state(page, "email_page_ready")
                 self._log("填写邮箱...")
                 page.fill("input[type='email']", self.email)
                 self._random_delay(1.0, 2.0)
                 if not self._safe_click(page, "button[type='submit']", refresh_state, "提交邮箱"):
                     self._log("提交邮箱失败，尝试继续流程", "warning")
                 self._debug_pause(page, "已提交邮箱")
+                self._dump_page_state(page, "email_submitted")
                 
                 # 使用更智能的状态机处理不确定的验证链路：可能是密码->OTP->信息，也可能是OTP->信息 等等。
                 # 使用状态机记录已完成的操作，防止由于页面跳转慢导致重复匹配和死循环
@@ -585,6 +810,7 @@ class BrowserRegistrationEngine:
                 for _step in range(6):
                     try:
                         self._log("等待进入下一个验证环节...")
+                        self._dump_page_state(page, f"register_step_{_step+1}_before_detect")
                         
                         # 动态构建当前需要等待的元素
                         selectors = []
@@ -631,6 +857,7 @@ class BrowserRegistrationEngine:
                         if not self._safe_click(page, "button[type='submit']", refresh_state, "提交密码"):
                             continue
                         self._debug_pause(page, "已提交密码")
+                        self._dump_page_state(page, "password_submitted")
 
                         # 等待密码输入框消失，判断是否真正进入下一环节
                         try:
@@ -672,6 +899,7 @@ class BrowserRegistrationEngine:
                             if not self._safe_click(page, "button[type='submit']", refresh_state, "提交验证码"):
                                 continue
                         self._debug_pause(page, "已提交验证码")
+                        self._dump_page_state(page, "otp_submitted")
                             
                         done_otp = True
                         try: page.wait_for_selector("input[name='code'], input[data-index='0']", state="hidden", timeout=10000)
@@ -795,6 +1023,7 @@ class BrowserRegistrationEngine:
                              if not self._safe_click(page, "button:has-text('Continue')", refresh_state, "提交个人信息"):
                                  continue
                         self._debug_pause(page, "已提交个人信息")
+                        self._dump_page_state(page, "profile_submitted")
                         break # 到此处验证链条就正式结束了
                         
                     # 如果当前没命中上述可见模块，可能已经过渡到一个新 URL，或者是跳过了某些步骤
@@ -804,9 +1033,11 @@ class BrowserRegistrationEngine:
                 # 等待最终跳转回 ChatGPT，获取 /api/auth/session
                 self._log("等待最终认证完成...")
                 page.wait_for_url("**/chatgpt.com**", timeout=45000)
+                self._dump_page_state(page, "chatgpt_home_after_auth")
                 
                 self._log("导航到 /api/auth/session 读取 tokens...")
                 page.goto("https://chatgpt.com/api/auth/session")
+                self._dump_page_state(page, "session_api_page")
                 try:
                     session_text = page.locator("body").inner_text()
                     import json
@@ -863,13 +1094,16 @@ class BrowserRegistrationEngine:
                                     )
                                     authorize_url = self._build_oauth_authorize_url(oauth_info.auth_url)
                                     page.goto(authorize_url)
+                                    self._dump_page_state(page, f"oauth_attempt_{attempt+1}_authorize")
                                     self._random_delay(1.0, 2.0)
                                     self._handle_oauth_relogin(page)
+                                    self._dump_page_state(page, f"oauth_attempt_{attempt+1}_after_relogin")
 
                                     callback_url = ""
                                     if self._is_oauth_consent_page(page):
                                         self._log("检测到 OAuth Consent 页面，立即点击继续并捕获回调...")
                                         self._click_oauth_consent_continue(page)
+                                        self._dump_page_state(page, f"oauth_attempt_{attempt+1}_consent_clicked")
                                         callback_url = self._capture_oauth_callback(page, timeout_ms=12000)
                                     else:
                                         callback_url = self._capture_oauth_callback(page, timeout_ms=6000)
@@ -881,6 +1115,7 @@ class BrowserRegistrationEngine:
                                     if not callback_url:
                                         self._log("试图点击授权界面的 Continue/Allow/继续 等确认许可键...")
                                         self._click_oauth_consent_continue(page)
+                                        self._dump_page_state(page, f"oauth_attempt_{attempt+1}_manual_consent_click")
 
                                         callback_url = self._capture_oauth_callback(page, timeout_ms=15000)
 
@@ -897,12 +1132,14 @@ class BrowserRegistrationEngine:
 
                                     final_oauth_url = callback_url or page.url
                                     if "code=" not in final_oauth_url or "state=" not in final_oauth_url:
+                                        self._dump_page_state(page, f"oauth_attempt_{attempt+1}_no_callback")
                                         if "add-phone" in final_oauth_url or "onboarding" in final_oauth_url:
                                             self._log("最终因为跳到 add-phone 页面，重新触发 OA 登录...", "warning")
                                             continue
                                         raise RuntimeError("未捕捉到 OAuth 回调 code/state")
 
                                     self._log("成功捕捉到 Code，正在调用接口进行兑换...")
+                                    self._dump_page_state(page, f"oauth_attempt_{attempt+1}_callback_ready")
                                     tokens_json = submit_callback_url(
                                         callback_url=final_oauth_url,
                                         expected_state=oauth_info.state,
@@ -970,6 +1207,10 @@ class BrowserRegistrationEngine:
             from .register import _extract_account_id_from_jwt
             aid = _extract_account_id_from_jwt(result.access_token)
             if aid: result.account_id = aid
+        if self.page_dump_dir:
+            if not isinstance(result.metadata, dict):
+                result.metadata = {}
+            result.metadata.setdefault("debug_page_dump_dir", str(self.page_dump_dir))
             
         return result
 

@@ -507,7 +507,7 @@ def _run_sync_registration_task(
                 log_callback(f"[邮箱] 使用服务: {label} (ID: {service_id_for_log}, 类型: {service_type.value})")
             else:
                 log_callback(f"[邮箱] 使用服务: {label} (类型: {service_type.value})")
-            log_callback(f"[Token] 获取方式: {'OAuth 授权' if token_mode == 'oauth' else '有头浏览器' if token_mode == 'browser' else 'Session 提取'}")
+            log_callback(f"[Token] 获取方式: {'OAuth 授权' if token_mode == 'oauth' else 'Playwright 浏览器' if token_mode == 'browser' else 'Session 提取'}")
 
             if token_mode == "browser":
                 try:
