@@ -2948,12 +2948,54 @@ class RegistrationEngine:
             return cookie_code
         return None
 
-    def _oauth_exchange_auth_code(self, session: cffi_requests.Session, oauth_start: OAuthStart) -> Optional[str]:
-        """从 consent/workspace/organization 流程中提取 OAuth code。"""
-        consent_url = f"{self.oauth_issuer}/sign-in-with-chatgpt/codex/consent"
-        auth_code: Optional[str] = None
+    def _oauth_extract_code_from_exception(
+        self,
+        session: cffi_requests.Session,
+        err: Exception,
+        redirect_uri: str,
+    ) -> Optional[str]:
+        """从异常信息与 Cookie 中提取 OAuth 授权码。"""
+        try:
+            m = re.search(r"(https?://localhost[^\s'\"]+)", str(err))
+            if m:
+                code = _extract_code_from_url(m.group(1))
+                if code:
+                    return code
+        except Exception:
+            pass
+        return self._extract_oauth_code_from_session_cookies(session, redirect_uri=redirect_uri)
 
-        # 0) 先访问本次 OAuth authorize 入口，确保 state/code_challenge 上下文是当前这次
+    def _oauth_follow_candidate_urls_for_code(
+        self,
+        session: cffi_requests.Session,
+        candidate_urls: list[str],
+        redirect_uri: str,
+    ) -> Optional[str]:
+        """按顺序跟随候选 URL，尝试提取 OAuth code。"""
+        visited: set[str] = set()
+        for candidate in candidate_urls:
+            url = str(candidate or "").strip()
+            if not url or url in visited:
+                continue
+            visited.add(url)
+            direct_code = _extract_code_from_url(url)
+            if direct_code:
+                return direct_code
+            code = self._oauth_follow_and_extract_code(session, url)
+            if code:
+                return code
+            cookie_code = self._extract_oauth_code_from_session_cookies(session, redirect_uri=redirect_uri)
+            if cookie_code:
+                return cookie_code
+        return None
+
+    def _oauth_visit_authorize_entry(
+        self,
+        session: cffi_requests.Session,
+        oauth_start: OAuthStart,
+    ) -> Tuple[Optional[str], str]:
+        """访问 OAuth authorize 入口，返回 (code, consent_url)。"""
+        consent_url = f"{self.oauth_issuer}/sign-in-with-chatgpt/codex/consent"
         try:
             resp_entry = session.get(
                 oauth_start.auth_url,
@@ -2967,196 +3009,305 @@ class RegistrationEngine:
                 stage="OAuth Authorize 入口",
             )
             self._log(f"OAuth Authorize 入口状态: {resp_entry.status_code}")
+
             if resp_entry.status_code in (301, 302, 303, 307, 308):
                 loc = resp_entry.headers.get("Location", "")
                 self._raise_if_phone_required(url=loc, stage="OAuth Authorize 入口(Location)")
                 entry_next = urljoin(oauth_start.auth_url, loc) if loc else ""
-                if entry_next:
-                    auth_code = _extract_code_from_url(entry_next)
-                    if "/sign-in-with-chatgpt/codex/consent" in entry_next:
-                        consent_url = entry_next
-                        self._log(f"OAuth Authorize 入口跳转到 Consent: {consent_url[:120]}...")
-                    if not auth_code and "/sign-in-with-chatgpt/codex/consent" not in entry_next:
-                        auth_code = self._oauth_follow_and_extract_code(session, entry_next)
-            elif resp_entry.status_code == 200:
+                if entry_next and "/sign-in-with-chatgpt/codex/consent" in entry_next:
+                    consent_url = entry_next
+                    self._log(f"OAuth Authorize 入口跳转到 Consent: {consent_url[:120]}...")
+                    return None, consent_url
+                code = self._oauth_follow_candidate_urls_for_code(
+                    session,
+                    [entry_next] if entry_next else [],
+                    redirect_uri=oauth_start.redirect_uri,
+                )
+                return code, consent_url
+
+            if resp_entry.status_code == 200:
+                code = _extract_code_from_url(str(resp_entry.url))
+                if code:
+                    return code, consent_url
+
                 entry_callback = self._extract_redirect_from_html(resp_entry.text or "", oauth_start.redirect_uri)
-                if entry_callback:
-                    auth_code = _extract_code_from_url(entry_callback)
-                if not auth_code and "/sign-in-with-chatgpt/codex/consent" in str(resp_entry.url):
+                code = _extract_code_from_url(entry_callback or "")
+                if code:
+                    return code, consent_url
+
+                nav_url = self._extract_navigation_url_from_html(resp_entry.text or "", base_url=str(resp_entry.url))
+                if nav_url and "/sign-in-with-chatgpt/codex/consent" in nav_url:
+                    consent_url = nav_url
+                    return None, consent_url
+                code = self._oauth_follow_candidate_urls_for_code(
+                    session,
+                    [nav_url] if nav_url else [],
+                    redirect_uri=oauth_start.redirect_uri,
+                )
+                if code:
+                    return code, consent_url
+
+                if "/sign-in-with-chatgpt/codex/consent" in str(resp_entry.url):
                     consent_url = str(resp_entry.url)
+                    return None, consent_url
         except Exception as e:
-            m = re.search(r"(https?://localhost[^\s'\"]+)", str(e))
-            if m:
-                auth_code = _extract_code_from_url(m.group(1))
-
-        # 1) 直接访问 consent，优先模拟表单“继续”提交获取 code
-        if not auth_code:
-            try:
-                resp_consent = session.get(
-                    consent_url,
-                    headers={"referer": f"{self.oauth_issuer}/log-in"},
-                    allow_redirects=False,
-                    timeout=30,
-                )
-                self._raise_if_phone_required(
-                    url=str(resp_consent.url),
-                    text=resp_consent.text or "",
-                    stage="OAuth Consent",
-                )
-                if resp_consent.status_code in (301, 302, 303, 307, 308):
-                    loc = resp_consent.headers.get("Location", "")
-                    self._raise_if_phone_required(url=loc, stage="OAuth Consent(Location)")
-                    auth_code = _extract_code_from_url(loc) or self._oauth_follow_and_extract_code(session, loc)
-                elif resp_consent.status_code == 200:
-                    auth_code = self._oauth_submit_consent_form(
-                        session,
-                        page_url=str(resp_consent.url),
-                        html_text=resp_consent.text or "",
-                        redirect_uri=oauth_start.redirect_uri,
-                        authorize_url=oauth_start.auth_url,
-                    )
-                    if not auth_code and self.oauth_enable_workspace_fallback:
-                        consent_workspace_id = self._extract_workspace_id_from_html(resp_consent.text or "")
-                        if consent_workspace_id:
-                            self._log(f"Consent 页面提取到 workspace_id: {consent_workspace_id}")
-                            ws_continue_url = self._oauth_select_workspace(session, consent_workspace_id)
-                            if ws_continue_url:
-                                auth_code = self._oauth_follow_and_extract_code(session, ws_continue_url)
-                    if not auth_code:
-                        cookie_code = self._extract_oauth_code_from_session_cookies(
-                            session,
-                            redirect_uri=oauth_start.redirect_uri,
-                        )
-                        if cookie_code:
-                            auth_code = cookie_code
-                    if not auth_code:
-                        # 仍未拿到 code，按真实授权链路继续跟随（不依赖 workspace）。
-                        for candidate_url in (
-                            oauth_start.auth_url,
-                            str(resp_consent.url),
-                            consent_url,
-                        ):
-                            if not candidate_url:
-                                continue
-                            follow_code = self._oauth_follow_and_extract_code(session, candidate_url)
-                            if follow_code:
-                                auth_code = follow_code
-                                break
-            except Exception as e:
-                m = re.search(r"(https?://localhost[^\s'\"]+)", str(e))
-                if m:
-                    auth_code = _extract_code_from_url(m.group(1))
-
-        # 2) 走 workspace / organization 流程（仅在 Consent 表单路径失败后兜底）
-        if not auth_code and self.oauth_enable_workspace_fallback:
-            workspace_id = self._oauth_get_workspace_id(
+            code = self._oauth_extract_code_from_exception(
                 session,
-                consent_url=consent_url,
+                e,
+                redirect_uri=oauth_start.redirect_uri,
+            )
+            if code:
+                return code, consent_url
+
+        return None, consent_url
+
+    def _oauth_try_consent_flow(
+        self,
+        session: cffi_requests.Session,
+        consent_url: str,
+        oauth_start: OAuthStart,
+    ) -> Optional[str]:
+        """优先走真实 Consent 页面继续授权链路。"""
+        try:
+            resp_consent = session.get(
+                consent_url,
+                headers={"referer": f"{self.oauth_issuer}/log-in"},
+                allow_redirects=False,
+                timeout=30,
+            )
+            self._raise_if_phone_required(
+                url=str(resp_consent.url),
+                text=resp_consent.text or "",
+                stage="OAuth Consent",
+            )
+
+            if resp_consent.status_code in (301, 302, 303, 307, 308):
+                loc = resp_consent.headers.get("Location", "")
+                self._raise_if_phone_required(url=loc, stage="OAuth Consent(Location)")
+                return self._oauth_follow_candidate_urls_for_code(
+                    session,
+                    [loc],
+                    redirect_uri=oauth_start.redirect_uri,
+                )
+
+            if resp_consent.status_code != 200:
+                return self._extract_oauth_code_from_session_cookies(
+                    session,
+                    redirect_uri=oauth_start.redirect_uri,
+                )
+
+            code = self._oauth_submit_consent_form(
+                session,
+                page_url=str(resp_consent.url),
+                html_text=resp_consent.text or "",
+                redirect_uri=oauth_start.redirect_uri,
                 authorize_url=oauth_start.auth_url,
             )
-            if workspace_id:
-                headers = {
-                    "referer": consent_url,
-                    "content-type": "application/json",
-                }
-                try:
-                    resp_ws = session.post(
-                        OPENAI_API_ENDPOINTS["select_workspace"],
-                        headers=headers,
-                        data=json.dumps({"workspace_id": workspace_id}),
-                        timeout=30,
-                        allow_redirects=False,
+            if code:
+                return code
+
+            cookie_code = self._extract_oauth_code_from_session_cookies(
+                session,
+                redirect_uri=oauth_start.redirect_uri,
+            )
+            if cookie_code:
+                return cookie_code
+
+            # 表单提交后仍无 code，继续跟随真实链路进行回跳提取。
+            return self._oauth_follow_candidate_urls_for_code(
+                session,
+                [
+                    oauth_start.auth_url,
+                    str(resp_consent.url),
+                    consent_url,
+                ],
+                redirect_uri=oauth_start.redirect_uri,
+            )
+        except Exception as e:
+            return self._oauth_extract_code_from_exception(
+                session,
+                e,
+                redirect_uri=oauth_start.redirect_uri,
+            )
+
+    def _oauth_try_workspace_flow(
+        self,
+        session: cffi_requests.Session,
+        consent_url: str,
+        oauth_start: OAuthStart,
+    ) -> Optional[str]:
+        """workspace/organization 旁路兜底（可配置开关）。"""
+        if not self.oauth_enable_workspace_fallback:
+            return None
+
+        workspace_id = self._oauth_get_workspace_id(
+            session,
+            consent_url=consent_url,
+            authorize_url=oauth_start.auth_url,
+        )
+        if not workspace_id:
+            return None
+
+        headers = {
+            "referer": consent_url,
+            "content-type": "application/json",
+        }
+        try:
+            resp_ws = session.post(
+                OPENAI_API_ENDPOINTS["select_workspace"],
+                headers=headers,
+                data=json.dumps({"workspace_id": workspace_id}),
+                timeout=30,
+                allow_redirects=False,
+            )
+            if resp_ws.status_code in (301, 302, 303, 307, 308):
+                loc = resp_ws.headers.get("Location", "")
+                self._raise_if_phone_required(url=loc, stage="OAuth Workspace(Location)")
+                return self._oauth_follow_candidate_urls_for_code(
+                    session,
+                    [loc],
+                    redirect_uri=oauth_start.redirect_uri,
+                )
+
+            if resp_ws.status_code != 200:
+                return None
+
+            ws_data = resp_ws.json() if resp_ws.text else {}
+            ws_next = str(ws_data.get("continue_url") or "")
+            ws_page = str(((ws_data.get("page") or {}).get("type")) or "")
+            self._raise_if_phone_required(
+                url=ws_next,
+                page_type=ws_page,
+                text=json.dumps(ws_data, ensure_ascii=False),
+                stage="OAuth Workspace",
+            )
+
+            if "organization" in ws_next or "organization" in ws_page:
+                org_url = ws_next if ws_next.startswith("http") else f"{self.oauth_issuer}{ws_next}"
+                org_id = None
+                project_id = None
+                ws_orgs = (ws_data.get("data") or {}).get("orgs", []) if isinstance(ws_data, dict) else []
+                if ws_orgs:
+                    org_id = (ws_orgs[0] or {}).get("id")
+                    projects = (ws_orgs[0] or {}).get("projects", [])
+                    if projects:
+                        project_id = (projects[0] or {}).get("id")
+
+                if not org_id:
+                    self._raise_if_phone_required(url=org_url, stage="OAuth Organization")
+                    return self._oauth_follow_and_extract_code(session, org_url)
+
+                body = {"org_id": org_id}
+                if project_id:
+                    body["project_id"] = project_id
+                resp_org = session.post(
+                    f"{self.oauth_issuer}/api/accounts/organization/select",
+                    json=body,
+                    headers={
+                        "referer": org_url,
+                        "content-type": "application/json",
+                    },
+                    timeout=30,
+                    allow_redirects=False,
+                )
+                if resp_org.status_code in (301, 302, 303, 307, 308):
+                    loc = resp_org.headers.get("Location", "")
+                    self._raise_if_phone_required(url=loc, stage="OAuth Organization(Location)")
+                    return self._oauth_follow_candidate_urls_for_code(
+                        session,
+                        [loc],
+                        redirect_uri=oauth_start.redirect_uri,
                     )
-                    if resp_ws.status_code in (301, 302, 303, 307, 308):
-                        loc = resp_ws.headers.get("Location", "")
-                        self._raise_if_phone_required(url=loc, stage="OAuth Workspace(Location)")
-                        auth_code = _extract_code_from_url(loc) or self._oauth_follow_and_extract_code(session, loc)
-                    elif resp_ws.status_code == 200:
-                        ws_data = resp_ws.json() if resp_ws.text else {}
-                        ws_next = str(ws_data.get("continue_url") or "")
-                        ws_page = str(((ws_data.get("page") or {}).get("type")) or "")
-                        self._raise_if_phone_required(
-                            url=ws_next,
-                            page_type=ws_page,
-                            text=json.dumps(ws_data, ensure_ascii=False),
-                            stage="OAuth Workspace",
-                        )
+                if resp_org.status_code == 200:
+                    org_next = str((resp_org.json() or {}).get("continue_url") or "")
+                    if org_next:
+                        full_next = org_next if org_next.startswith("http") else f"{self.oauth_issuer}{org_next}"
+                        self._raise_if_phone_required(url=full_next, stage="OAuth Organization")
+                        return self._oauth_follow_and_extract_code(session, full_next)
+                return None
 
-                        if "organization" in ws_next or "organization" in ws_page:
-                            org_url = ws_next if ws_next.startswith("http") else f"{self.oauth_issuer}{ws_next}"
-                            org_id = None
-                            project_id = None
-                            ws_orgs = (ws_data.get("data") or {}).get("orgs", []) if isinstance(ws_data, dict) else []
-                            if ws_orgs:
-                                org_id = (ws_orgs[0] or {}).get("id")
-                                projects = (ws_orgs[0] or {}).get("projects", [])
-                                if projects:
-                                    project_id = (projects[0] or {}).get("id")
+            if ws_next:
+                full_next = ws_next if ws_next.startswith("http") else f"{self.oauth_issuer}{ws_next}"
+                self._raise_if_phone_required(url=full_next, stage="OAuth Workspace")
+                return self._oauth_follow_and_extract_code(session, full_next)
+            return None
+        except Exception as e:
+            self._log(f"OAuth workspace/organization 处理异常: {e}", "warning")
+            return self._oauth_extract_code_from_exception(
+                session,
+                e,
+                redirect_uri=oauth_start.redirect_uri,
+            )
 
-                            if org_id:
-                                body = {"org_id": org_id}
-                                if project_id:
-                                    body["project_id"] = project_id
-                                resp_org = session.post(
-                                    f"{self.oauth_issuer}/api/accounts/organization/select",
-                                    json=body,
-                                    headers={
-                                        "referer": org_url,
-                                        "content-type": "application/json",
-                                    },
-                                    timeout=30,
-                                    allow_redirects=False,
-                                )
-                                if resp_org.status_code in (301, 302, 303, 307, 308):
-                                    loc = resp_org.headers.get("Location", "")
-                                    self._raise_if_phone_required(url=loc, stage="OAuth Organization(Location)")
-                                    auth_code = _extract_code_from_url(loc) or self._oauth_follow_and_extract_code(session, loc)
-                                elif resp_org.status_code == 200:
-                                    org_next = str((resp_org.json() or {}).get("continue_url") or "")
-                                    if org_next:
-                                        full_next = org_next if org_next.startswith("http") else f"{self.oauth_issuer}{org_next}"
-                                        self._raise_if_phone_required(url=full_next, stage="OAuth Organization")
-                                        auth_code = self._oauth_follow_and_extract_code(session, full_next)
-                            else:
-                                self._raise_if_phone_required(url=org_url, stage="OAuth Organization")
-                                auth_code = self._oauth_follow_and_extract_code(session, org_url)
-                        elif ws_next:
-                            full_next = ws_next if ws_next.startswith("http") else f"{self.oauth_issuer}{ws_next}"
-                            self._raise_if_phone_required(url=full_next, stage="OAuth Workspace")
-                            auth_code = self._oauth_follow_and_extract_code(session, full_next)
-                except Exception as e:
-                    self._log(f"OAuth workspace/organization 处理异常: {e}", "warning")
-        elif not auth_code:
+    def _oauth_try_final_redirect_fallback(
+        self,
+        session: cffi_requests.Session,
+        consent_url: str,
+        oauth_start: OAuthStart,
+    ) -> Optional[str]:
+        """最后兜底：允许自动重定向后再提取 code。"""
+        try:
+            resp_fallback = session.get(
+                consent_url,
+                headers={"referer": f"{self.oauth_issuer}/log-in"},
+                allow_redirects=True,
+                timeout=30,
+            )
+            self._raise_if_phone_required(
+                url=str(resp_fallback.url),
+                text=resp_fallback.text or "",
+                stage="OAuth Consent(兜底)",
+            )
+            code = _extract_code_from_url(str(resp_fallback.url))
+            if code:
+                return code
+            if getattr(resp_fallback, "history", None):
+                for hist in resp_fallback.history:
+                    loc = hist.headers.get("Location", "")
+                    self._raise_if_phone_required(url=loc, stage="OAuth Consent(兜底 Location)")
+                    code = _extract_code_from_url(loc)
+                    if code:
+                        return code
+            return self._extract_oauth_code_from_session_cookies(
+                session,
+                redirect_uri=oauth_start.redirect_uri,
+            )
+        except Exception as e:
+            return self._oauth_extract_code_from_exception(
+                session,
+                e,
+                redirect_uri=oauth_start.redirect_uri,
+            )
+
+    def _oauth_exchange_auth_code(self, session: cffi_requests.Session, oauth_start: OAuthStart) -> Optional[str]:
+        """从 OAuth 授权链路中提取 code。默认优先 Consent -> Callback。"""
+        entry_code, consent_url = self._oauth_visit_authorize_entry(session, oauth_start)
+        if entry_code:
+            return entry_code
+
+        consent_code = self._oauth_try_consent_flow(
+            session,
+            consent_url=consent_url,
+            oauth_start=oauth_start,
+        )
+        if consent_code:
+            return consent_code
+
+        workspace_code = self._oauth_try_workspace_flow(
+            session,
+            consent_url=consent_url,
+            oauth_start=oauth_start,
+        )
+        if workspace_code:
+            return workspace_code
+        if not self.oauth_enable_workspace_fallback:
             self._log("Consent 链路暂未提取到 code，已禁用 workspace/organization 旁路", "warning")
 
-        # 3) 最后兜底：允许自动重定向
-        if not auth_code:
-            try:
-                resp_fallback = session.get(
-                    consent_url,
-                    headers={"referer": f"{self.oauth_issuer}/log-in"},
-                    allow_redirects=True,
-                    timeout=30,
-                )
-                self._raise_if_phone_required(
-                    url=str(resp_fallback.url),
-                    text=resp_fallback.text or "",
-                    stage="OAuth Consent(兜底)",
-                )
-                auth_code = _extract_code_from_url(str(resp_fallback.url))
-                if not auth_code and getattr(resp_fallback, "history", None):
-                    for hist in resp_fallback.history:
-                        loc = hist.headers.get("Location", "")
-                        self._raise_if_phone_required(url=loc, stage="OAuth Consent(兜底 Location)")
-                        auth_code = _extract_code_from_url(loc)
-                        if auth_code:
-                            break
-            except Exception as e:
-                m = re.search(r"(https?://localhost[^\s'\"]+)", str(e))
-                if m:
-                    auth_code = _extract_code_from_url(m.group(1))
-
-        return auth_code
+        return self._oauth_try_final_redirect_fallback(
+            session,
+            consent_url=consent_url,
+            oauth_start=oauth_start,
+        )
 
     def _oauth_handle_callback(
         self,
