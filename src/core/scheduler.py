@@ -114,7 +114,13 @@ def _infer_status_code_from_text(text: str) -> Optional[int]:
     if not text:
         return None
     lower = text.lower()
-    if "token_revoked" in lower or "token_invalidated" in lower or "invalidated oauth token" in lower:
+    if (
+        "token_revoked" in lower
+        or "token_invalidated" in lower
+        or "invalidated oauth token" in lower
+        or "authentication token has been invalidated" in lower
+        or "token has been invalidated" in lower
+    ):
         return 401
     if "unauthorized" in lower:
         return 401
@@ -334,6 +340,30 @@ def _format_known_cliproxy_error(error_type: str) -> str:
     return f"错误类型: {error_type}"
 
 
+def _is_usage_limit_reached_text(text: Any) -> bool:
+    lower = str(text or "").strip().lower()
+    if not lower:
+        return False
+    return (
+        "usage_limit_reached" in lower
+        or "the usage limit has been reached" in lower
+        or "usage limit has been reached" in lower
+        or "周限额已耗尽" in lower
+        or "额度已耗尽" in lower
+    )
+
+
+def _payload_has_usage_limit_reached(payload: Any) -> bool:
+    data = _decode_possible_json_payload(payload)
+    if isinstance(data, str):
+        return _is_usage_limit_reached_text(data)
+    try:
+        raw = json.dumps(data, ensure_ascii=False)
+    except Exception:
+        raw = str(data)
+    return _is_usage_limit_reached_text(raw)
+
+
 def _extract_rate_limit_reason(
     rate_info: Any,
     key: str,
@@ -368,15 +398,20 @@ def _extract_cliproxy_failure_reason(
     data = _decode_possible_json_payload(payload)
 
     if isinstance(data, str):
+        lower_text = data.lower()
+        if _is_usage_limit_reached_text(lower_text):
+            return _format_known_cliproxy_error("usage_limit_reached")
         for keyword in (
-            "usage_limit_reached",
             "account_deactivated",
             "insufficient_quota",
             "invalid_api_key",
             "unsupported_region",
         ):
-            if keyword in data:
+            if keyword in lower_text:
                 return _format_known_cliproxy_error(keyword)
+        inferred_status = _infer_status_code_from_text(data)
+        if inferred_status in (401, 403):
+            return f"status_code={inferred_status}"
         return None
 
     if not isinstance(data, dict):
@@ -389,6 +424,8 @@ def _extract_cliproxy_failure_reason(
             return _format_known_cliproxy_error(err_type)
         message = error.get("message")
         if message:
+            if _is_usage_limit_reached_text(message):
+                return _format_known_cliproxy_error("usage_limit_reached")
             return str(message)
 
     for key in ("rate_limit", "code_review_rate_limit"):
@@ -430,15 +467,21 @@ def _extract_cliproxy_failure_reason(
             return reason
 
     data_str = json.dumps(data, ensure_ascii=False)
+    lower_data_str = data_str.lower()
+    if _is_usage_limit_reached_text(lower_data_str):
+        return _format_known_cliproxy_error("usage_limit_reached")
     for keyword in (
-        "usage_limit_reached",
         "account_deactivated",
         "insufficient_quota",
         "invalid_api_key",
         "unsupported_region",
     ):
-        if keyword in data_str:
+        if keyword in lower_data_str:
             return _format_known_cliproxy_error(keyword)
+
+    inferred_status = _infer_status_code_from_text(data_str)
+    if inferred_status in (401, 403):
+        return f"status_code={inferred_status}"
 
     return None
 
@@ -447,12 +490,18 @@ def _extract_cliproxy_item_failure_reason(
     item: dict,
     min_remaining_weekly_percent: int = 0,
 ) -> Optional[str]:
+    status_message = item.get("status_message")
     reason = _extract_cliproxy_failure_reason(
-        item.get("status_message"),
+        status_message,
         min_remaining_weekly_percent,
     )
     if item.get("unavailable") is True:
         return f"unavailable ({reason or item.get('status') or 'unknown'})"
+
+    if not reason and isinstance(status_message, str):
+        inferred_status = _infer_status_code_from_text(status_message)
+        if inferred_status in (401, 403):
+            reason = f"status_code={inferred_status}"
 
     status = str(item.get("status") or "").strip().lower()
     if status in {"invalid", "disabled"}:
@@ -468,7 +517,10 @@ def _extract_cliproxy_panel_direct_reason(item: dict) -> Optional[str]:
         return f"status_code={status_code}"
 
     reason = _extract_cliproxy_failure_reason(item, 0)
-    if reason and "usage_limit_reached" in str(reason).lower():
+    inferred_status = _infer_status_code_from_text(str(reason or ""))
+    if inferred_status in (401, 403):
+        return f"status_code={inferred_status}"
+    if reason and _is_usage_limit_reached_text(reason):
         return reason
 
     return None
@@ -478,7 +530,7 @@ def _describe_cliproxy_failure(msg: str) -> str:
     text = str(msg or "")
     if "低于阈值" in text:
         return "周限额低于阈值"
-    if "周限额已耗尽" in text or "usage_limit_reached" in text:
+    if "周限额已耗尽" in text or _is_usage_limit_reached_text(text):
         return "周限额已耗尽"
     if "代码审查周限额已耗尽" in text:
         return "代码审查周限额已耗尽"
@@ -793,6 +845,12 @@ def _parse_window_hours(window: dict) -> Optional[float]:
 
 def _extract_quota_metrics(payload: Any) -> dict:
     data = _decode_possible_json_payload(payload)
+    if _payload_has_usage_limit_reached(data):
+        return {
+            "weekly_remaining_percent": 0.0,
+            "five_hour_remaining_percent": 0.0,
+            "has_five_hour_limit": True,
+        }
     if not isinstance(data, dict):
         return {
             "weekly_remaining_percent": None,
@@ -1490,6 +1548,8 @@ def _apply_quota_rules_for_service(svc, files: List[dict], quota_rules: List[dic
             time.sleep(settings.cpa_auto_check_sleep_seconds)
         probe_result = probe_cliproxy_auth_file(item, svc.api_url, svc.api_token)
         quota = probe_result.get("quota") or {}
+        if _is_usage_limit_reached_text(probe_result.get("failure_reason")):
+            _log(f"检测到 usage_limit_reached，按额度耗尽(0%)处理: {name}", "warning")
 
         matched_rule = None
         matched_metric_value = None
@@ -1605,7 +1665,9 @@ def check_cpa_services_job(
                             if check_mode not in ("probe", "panel"):
                                 check_mode = "panel"
 
-                            _log(f"任务A/失效检测开始（模式: {check_mode}）")
+                            _log(
+                                f"任务A/失效检测开始（模式: {check_mode}，处理范围: Codex 凭证，共 {len(files)} 个）"
+                            )
                             files_after_invalid = _apply_invalid_rules_for_service(
                                 svc=svc,
                                 files=files,
@@ -1614,9 +1676,15 @@ def check_cpa_services_job(
                                 settings=settings,
                                 _log=_log,
                             )
-                            _log(f"任务A/失效检测完成，剩余凭证: {len(files_after_invalid)}")
+                            _log(
+                                "任务A/失效检测完成（仅统计 Codex 处理中的数量，非服务全量）: "
+                                f"处理前={len(files)}, 处理后={len(files_after_invalid)}"
+                            )
 
-                            _log("任务B/限额策略开始")
+                            _log(
+                                "任务B/限额策略开始（承接任务A输出，仍仅处理 Codex）: "
+                                f"处理中的数量={len(files_after_invalid)}"
+                            )
                             files_after_quota = _apply_quota_rules_for_service(
                                 svc=svc,
                                 files=files_after_invalid,
@@ -1624,14 +1692,20 @@ def check_cpa_services_job(
                                 settings=settings,
                                 _log=_log,
                             )
-                            _log(f"任务B/限额策略完成，剩余凭证: {len(files_after_quota)}")
+                            _log(
+                                "任务B/限额策略完成（仅统计 Codex 处理中的数量，非服务全量）: "
+                                f"处理前={len(files_after_invalid)}, 处理后={len(files_after_quota)}"
+                            )
                         else:
                             _log("体检开关关闭，跳过失效/限额策略，仅保留数量监控。")
 
-                    refreshed_files, _total_count, _skipped_count = fetch_cliproxy_auth_files(svc.api_url, svc.api_token)
+                    refreshed_files, refreshed_total_count, refreshed_skipped_count = fetch_cliproxy_auth_files(
+                        svc.api_url, svc.api_token
+                    )
                     enabled_count = sum(1 for item in refreshed_files if _extract_item_status_for_rule(item) == "enabled")
                     _log(
-                        f"CPA 服务 {svc.name} 策略执行后可用凭证: {enabled_count} / {len(refreshed_files)}"
+                        f"CPA 服务 {svc.name} 策略执行后可用凭证(Codex): {enabled_count} / {len(refreshed_files)} "
+                        f"（服务总凭证: {refreshed_total_count}, 非Codex跳过: {refreshed_skipped_count}）"
                     )
                     _trigger_auto_registration_if_needed(main_loop, svc, enabled_count, settings, _log)
                 except Exception as e:
