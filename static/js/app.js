@@ -1095,7 +1095,7 @@ function updateEmailServiceOptions() {
         }, '暂无可用服务');
     }
 
-    // DuckMail
+    // Duck 邮箱服务（包含 DuckMail.sbs 与 DuckDuckMail）
     if (availableServices.duck_mail?.available) {
         addGroup(`🦆 DuckMail (${availableServices.duck_mail.count} 个服务)`, availableServices.duck_mail.services, (service) => {
             const value = `duck_mail:${service.id}`;

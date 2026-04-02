@@ -109,7 +109,31 @@ def setup_application():
     logger.info(f"日志目录: {logs_dir}")
 
     logger.info("应用程序设置完成")
-    return settings
+    return settings, {
+        "data_dir": data_dir,
+        "logs_dir": logs_dir,
+        "log_file": log_file,
+        "log_to_stdout": log_to_stdout,
+    }
+
+
+def _print_startup_summary(settings, runtime: dict, uvicorn_config: dict) -> None:
+    """在终端打印启动摘要（不依赖 logging 配置）。"""
+    host = str(settings.webui_host or uvicorn_config.get("host") or "0.0.0.0").strip()
+    port = int(settings.webui_port or uvicorn_config.get("port") or 8000)
+    local_url = f"http://127.0.0.1:{port}"
+    listen_url = f"http://{host}:{port}"
+
+    print("\n============================================================", flush=True)
+    print("OpenAI/Codex 注册系统 Web UI 正在启动...", flush=True)
+    print(f"监听地址: {listen_url}", flush=True)
+    if host in ("0.0.0.0", "::", ""):
+        print(f"本机访问: {local_url}", flush=True)
+    print(f"调试模式: {'开启' if bool(settings.debug) else '关闭'}", flush=True)
+    print(f"控制台日志: {'开启' if bool(runtime.get('log_to_stdout')) else '关闭(仅写文件)'}", flush=True)
+    print(f"日志文件: {runtime.get('log_file')}", flush=True)
+    print(f"数据目录: {runtime.get('data_dir')}", flush=True)
+    print("============================================================\n", flush=True)
 
 
 def _derive_persistent_root(root: Path) -> Path | None:
@@ -155,7 +179,7 @@ def _resolve_runtime_dirs(root: Path) -> tuple[Path, Path]:
 def start_webui():
     """启动 Web UI"""
     # 设置应用程序
-    settings = setup_application()
+    settings, runtime = setup_application()
 
     # 导入 FastAPI 应用（延迟导入以避免循环依赖）
     from src.web.app import app
@@ -179,6 +203,7 @@ def start_webui():
     logger = logging.getLogger(__name__)
     logger.info(f"启动 Web UI 在 http://{settings.webui_host}:{settings.webui_port}")
     logger.info(f"调试模式: {settings.debug}")
+    _print_startup_summary(settings, runtime, uvicorn_config)
 
     # 启动服务器
     uvicorn.run(**uvicorn_config)
