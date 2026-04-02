@@ -252,6 +252,30 @@ class TempMailService(BaseEmailService):
             return ""
         return re.sub(EMAIL_ADDRESS_PATTERN, " ", text)
 
+    def _is_openai_verification_mail(self, sender: str, content: str) -> bool:
+        """
+        判断是否属于 OpenAI/ChatGPT 验证邮件。
+
+        说明：
+        - 部分邮箱平台会把发件人翻译成“无回复”，或不暴露 openai 域名；
+        - 因此除了 openai，也要匹配 chatgpt/验证码语义关键词。
+        """
+        sender_text = str(sender or "").lower()
+        content_text = str(content or "").lower()
+        markers = (
+            "openai",
+            "chatgpt",
+            "verification code",
+            "your chatgpt code",
+            "code is",
+            "验证码",
+            "验证代码",
+            "临时验证码",
+            "chatgpt 代码",
+            "chatgpt code",
+        )
+        return any(marker in sender_text or marker in content_text for marker in markers)
+
     def create_email(self, config: Dict[str, Any] = None) -> Dict[str, Any]:
         """
         通过 admin API 创建临时邮箱
@@ -377,8 +401,8 @@ class TempMailService(BaseEmailService):
                     content = f"{sender}\n{subject}\n{body_text}\n{raw_text}".strip()
                     safe_content = self._strip_email_addresses(content)
 
-                    # 只处理 OpenAI 邮件
-                    if "openai" not in sender and "openai" not in content.lower():
+                    # 仅处理 OpenAI/ChatGPT 验证相关邮件
+                    if not self._is_openai_verification_mail(sender, content):
                         continue
 
                     match = re.search(pattern, safe_content)

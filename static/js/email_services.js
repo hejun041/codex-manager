@@ -52,6 +52,11 @@ const elements = {
     addTempmailFields: document.getElementById('add-tempmail-fields'),
     addDuckmailFields: document.getElementById('add-duckmail-fields'),
     addCloudmailFields: document.getElementById('add-cloudmail-fields'),
+    addCloudmailBaseUrl: document.getElementById('custom-cm-base-url'),
+    addCloudmailAdminEmail: document.getElementById('custom-cm-admin-email'),
+    addCloudmailAdminPassword: document.getElementById('custom-cm-admin-password'),
+    addCloudmailApiToken: document.getElementById('custom-cm-api-token'),
+    addCloudmailGenTokenBtn: document.getElementById('add-cm-gen-token-btn'),
 
     // 编辑自定义域名模态框
     editCustomModal: document.getElementById('edit-custom-modal'),
@@ -64,6 +69,11 @@ const elements = {
     editCloudmailFields: document.getElementById('edit-cloudmail-fields'),
     editCustomTypeBadge: document.getElementById('edit-custom-type-badge'),
     editCustomSubTypeHidden: document.getElementById('edit-custom-sub-type-hidden'),
+    editCloudmailBaseUrl: document.getElementById('edit-cm-base-url'),
+    editCloudmailAdminEmail: document.getElementById('edit-cm-admin-email'),
+    editCloudmailAdminPassword: document.getElementById('edit-cm-admin-password'),
+    editCloudmailApiToken: document.getElementById('edit-cm-api-token'),
+    editCloudmailGenTokenBtn: document.getElementById('edit-cm-gen-token-btn'),
 
     // 编辑 Outlook 模态框
     editOutlookModal: document.getElementById('edit-outlook-modal'),
@@ -139,6 +149,9 @@ function initEventListeners() {
     elements.closeCustomModal.addEventListener('click', () => elements.addCustomModal.classList.remove('active'));
     elements.cancelAddCustom.addEventListener('click', () => elements.addCustomModal.classList.remove('active'));
     elements.addCustomForm.addEventListener('submit', handleAddCustom);
+    if (elements.addCloudmailGenTokenBtn) {
+        elements.addCloudmailGenTokenBtn.addEventListener('click', handleAddCloudMailTokenGenerate);
+    }
 
     // 类型切换（添加表单）
     elements.customSubType.addEventListener('change', (e) => switchAddSubType(e.target.value));
@@ -147,6 +160,9 @@ function initEventListeners() {
     elements.closeEditCustomModal.addEventListener('click', () => elements.editCustomModal.classList.remove('active'));
     elements.cancelEditCustom.addEventListener('click', () => elements.editCustomModal.classList.remove('active'));
     elements.editCustomForm.addEventListener('submit', handleEditCustom);
+    if (elements.editCloudmailGenTokenBtn) {
+        elements.editCloudmailGenTokenBtn.addEventListener('click', handleEditCloudMailTokenGenerate);
+    }
 
     // 编辑 Outlook
     elements.closeEditOutlookModal.addEventListener('click', () => elements.editOutlookModal.classList.remove('active'));
@@ -192,6 +208,79 @@ function switchEditSubType(subType) {
     elements.editDuckmailFields.style.display = subType === 'duckmail' ? '' : 'none';
     elements.editCloudmailFields.style.display = subType === 'cloudmail' ? '' : 'none';
     elements.editCustomTypeBadge.textContent = CUSTOM_SUBTYPE_LABELS[subType] || CUSTOM_SUBTYPE_LABELS.moemail;
+}
+
+function normalizeUrl(value) {
+    return String(value || '').trim().replace(/\/+$/, '');
+}
+
+async function generateCloudMailTokenByPassword(baseUrl, adminEmail, adminPassword, buttonEl) {
+    const normalizedBaseUrl = normalizeUrl(baseUrl);
+    const normalizedAdminEmail = String(adminEmail || '').trim();
+    const normalizedAdminPassword = String(adminPassword || '').trim();
+
+    if (!normalizedBaseUrl) {
+        throw new Error('请先填写 CloudMail API 地址');
+    }
+    if (!normalizedAdminEmail) {
+        throw new Error('请先填写管理员邮箱');
+    }
+    if (!normalizedAdminPassword) {
+        throw new Error('请先填写管理员密码');
+    }
+
+    const originText = buttonEl ? buttonEl.textContent : '';
+    if (buttonEl) {
+        buttonEl.disabled = true;
+        buttonEl.textContent = '获取中...';
+    }
+
+    try {
+        const resp = await api.post('/email-services/cloudmail/gen-token', {
+            base_url: normalizedBaseUrl,
+            admin_email: normalizedAdminEmail,
+            admin_password: normalizedAdminPassword
+        });
+        if (!resp?.token) {
+            throw new Error('CloudMail 未返回 Token');
+        }
+        return String(resp.token).trim();
+    } finally {
+        if (buttonEl) {
+            buttonEl.disabled = false;
+            buttonEl.textContent = originText || '通过密码获取 Token';
+        }
+    }
+}
+
+async function handleAddCloudMailTokenGenerate() {
+    try {
+        const token = await generateCloudMailTokenByPassword(
+            elements.addCloudmailBaseUrl?.value,
+            elements.addCloudmailAdminEmail?.value,
+            elements.addCloudmailAdminPassword?.value,
+            elements.addCloudmailGenTokenBtn
+        );
+        elements.addCloudmailApiToken.value = token;
+        toast.success('CloudMail Token 获取成功');
+    } catch (error) {
+        toast.error(error.message || 'CloudMail Token 获取失败');
+    }
+}
+
+async function handleEditCloudMailTokenGenerate() {
+    try {
+        const token = await generateCloudMailTokenByPassword(
+            elements.editCloudmailBaseUrl?.value,
+            elements.editCloudmailAdminEmail?.value,
+            elements.editCloudmailAdminPassword?.value,
+            elements.editCloudmailGenTokenBtn
+        );
+        elements.editCloudmailApiToken.value = token;
+        toast.success('CloudMail Token 获取成功');
+    } catch (error) {
+        toast.error(error.message || 'CloudMail Token 获取失败');
+    }
 }
 
 // 加载统计信息
@@ -441,6 +530,8 @@ async function handleAddCustom(e) {
         config = {
             base_url: formData.get('cm_base_url'),
             api_token: formData.get('cm_api_token'),
+            admin_email: formData.get('cm_admin_email'),
+            admin_password: formData.get('cm_admin_password'),
             domain: formData.get('cm_domain')
         };
     } else {
@@ -615,8 +706,11 @@ async function editCustomService(id, subType) {
             document.getElementById('edit-tm-domain').value = service.config?.domain || '';
         } else if (resolvedSubType === 'cloudmail') {
             document.getElementById('edit-cm-base-url').value = service.config?.base_url || '';
-            document.getElementById('edit-cm-api-token').value = '';
-            document.getElementById('edit-cm-api-token').placeholder = service.config?.api_token ? '已设置，留空保持不变' : '请输入 API Token';
+            document.getElementById('edit-cm-admin-email').value = service.config?.admin_email || '';
+            document.getElementById('edit-cm-admin-password').value = '';
+            document.getElementById('edit-cm-admin-password').placeholder = service.config?.admin_password ? '已设置，留空保持不变' : '请输入管理员密码';
+            document.getElementById('edit-cm-api-token').value = service.config?.api_token || '';
+            document.getElementById('edit-cm-api-token').placeholder = '请输入 API Token';
             document.getElementById('edit-cm-domain').value = service.config?.default_domain || service.config?.domain || '';
         } else {
             document.getElementById('edit-dm-base-url').value = service.config?.base_url || '';
@@ -658,8 +752,11 @@ async function handleEditCustom(e) {
     } else if (subType === 'cloudmail') {
         config = {
             base_url: formData.get('cm_base_url'),
+            admin_email: formData.get('cm_admin_email'),
             domain: formData.get('cm_domain')
         };
+        const adminPassword = formData.get('cm_admin_password');
+        if (adminPassword && adminPassword.trim()) config.admin_password = adminPassword.trim();
         const apiToken = formData.get('cm_api_token');
         if (apiToken && apiToken.trim()) config.api_token = apiToken.trim();
     } else {

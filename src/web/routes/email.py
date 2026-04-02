@@ -81,10 +81,23 @@ class OutlookBatchImportResponse(BaseModel):
     errors: List[str]
 
 
+class CloudMailGenTokenRequest(BaseModel):
+    """CloudMail 通过管理员账号生成 Token"""
+    base_url: str
+    admin_email: str
+    admin_password: str
+
+
+class CloudMailGenTokenResponse(BaseModel):
+    """CloudMail 生成 Token 响应"""
+    success: bool
+    token: str
+
+
 # ============== Helper Functions ==============
 
 # 敏感字段列表，返回响应时需要过滤
-SENSITIVE_FIELDS = {'password', 'api_key', 'api_token', 'refresh_token', 'access_token'}
+SENSITIVE_FIELDS = {'password', 'admin_password', 'api_key', 'api_token', 'refresh_token', 'access_token'}
 
 def filter_sensitive_config(config: Dict[str, Any]) -> Dict[str, Any]:
     """过滤敏感配置信息"""
@@ -226,9 +239,11 @@ async def get_service_types():
             {
                 "value": "cloud_mail",
                 "label": "CloudMail",
-                "description": "CloudMail API 邮箱服务，支持 Token 访问",
+                "description": "CloudMail API 邮箱服务，支持管理员密码换取 Token",
                 "config_fields": [
                     {"name": "base_url", "label": "API 地址", "required": True, "placeholder": "https://mail.example.com"},
+                    {"name": "admin_email", "label": "管理员邮箱", "required": False},
+                    {"name": "admin_password", "label": "管理员密码", "required": False, "secret": True},
                     {"name": "api_token", "label": "API Token", "required": True, "secret": True},
                     {"name": "domain", "label": "邮箱域名", "required": True, "placeholder": "example.com"},
                     {"name": "auth_header", "label": "鉴权 Header", "required": False, "default": "Authorization"},
@@ -260,6 +275,73 @@ async def list_email_services(
             total=len(services),
             services=[service_to_response(s) for s in services]
         )
+
+
+@router.post("/cloudmail/gen-token", response_model=CloudMailGenTokenResponse)
+async def cloudmail_gen_token(request: CloudMailGenTokenRequest):
+    """通过 CloudMail 管理员邮箱密码生成 API Token。"""
+    from curl_cffi import requests as cffi_requests
+
+    base_url = str(request.base_url or "").strip().rstrip("/")
+    admin_email = str(request.admin_email or "").strip()
+    admin_password = str(request.admin_password or "").strip()
+
+    if not base_url:
+        raise HTTPException(status_code=400, detail="CloudMail API 地址不能为空")
+    if not base_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="CloudMail API 地址必须以 http:// 或 https:// 开头")
+    if not admin_email:
+        raise HTTPException(status_code=400, detail="管理员邮箱不能为空")
+    if not admin_password:
+        raise HTTPException(status_code=400, detail="管理员密码不能为空")
+
+    endpoint = f"{base_url}/api/public/genToken"
+    payload = {
+        "email": admin_email,
+        "password": admin_password,
+    }
+
+    try:
+        resp = cffi_requests.post(
+            endpoint,
+            json=payload,
+            timeout=20,
+            impersonate="chrome110",
+        )
+    except Exception as e:
+        logger.error(f"CloudMail 生成 Token 请求失败: {e}")
+        raise HTTPException(status_code=502, detail=f"请求 CloudMail 失败: {e}")
+
+    try:
+        body = resp.json() if resp.text else {}
+    except Exception:
+        body = {}
+
+    token = ""
+    if isinstance(body, dict):
+        data = body.get("data")
+        if isinstance(data, dict):
+            token = str(data.get("token") or data.get("api_token") or "").strip()
+        if not token:
+            token = str(body.get("token") or body.get("api_token") or "").strip()
+
+    code = body.get("code") if isinstance(body, dict) else None
+    code_ok = code in (None, 0, 200, "0", "200")
+
+    if resp.status_code != 200 or not code_ok or not token:
+        detail_msg = ""
+        if isinstance(body, dict):
+            detail_msg = str(
+                body.get("message")
+                or body.get("msg")
+                or body.get("error")
+                or ""
+            ).strip()
+        if not detail_msg:
+            detail_msg = f"HTTP {resp.status_code}"
+        raise HTTPException(status_code=400, detail=f"CloudMail 生成 Token 失败: {detail_msg}")
+
+    return CloudMailGenTokenResponse(success=True, token=token)
 
 
 @router.get("/{service_id}", response_model=EmailServiceResponse)

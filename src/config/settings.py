@@ -525,6 +525,12 @@ SETTING_DEFINITIONS: Dict[str, SettingDefinition] = {
         category=SettingCategory.CPA,
         description="自动补充注册的 Token 获取方式（browser_http_only/browser_http_first/browser）"
     ),
+    "cpa_auto_policy_rules": SettingDefinition(
+        db_key="cpa.auto_policy_rules",
+        default_value="[]",
+        category=SettingCategory.CPA,
+        description="定时 CPA 规则策略（JSON）"
+    ),
 
     # 验证码配置
     "email_code_timeout": SettingDefinition(
@@ -683,6 +689,7 @@ SETTING_TYPES: Dict[str, Type] = {
     "cpa_auto_register_batch_count": int,
     "cpa_auto_register_email_service": str,
     "cpa_auto_register_token_mode": str,
+    "cpa_auto_policy_rules": str,
     "email_code_timeout": int,
     "email_code_poll_interval": int,
     "outlook_provider_priority": list,
@@ -1018,6 +1025,7 @@ class Settings(BaseModel):
     cpa_auto_register_batch_count: int = 5
     cpa_auto_register_email_service: str = ""
     cpa_auto_register_token_mode: str = "browser_http_only"
+    cpa_auto_policy_rules: str = "[]"
 
     # 验证码配置
     email_code_timeout: int = 120

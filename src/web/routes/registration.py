@@ -1564,8 +1564,7 @@ async def get_available_email_services():
     获取可用于注册的邮箱服务列表
 
     返回所有已启用的邮箱服务，包括：
-    - tempmail: 临时邮箱（无需配置）
-    - generator_email: 临时邮箱（无需配置）
+    - tempmail: 临时邮箱渠道（Tempmail.lol / Generator.email，当前版本默认隐藏）
     - outlook: 已导入的 Outlook 账户
     - custom_domain: 已配置的自定义域名服务
     - temp_mail: 自部署 Temp-Mail 服务
@@ -1578,19 +1577,9 @@ async def get_available_email_services():
     settings = get_settings()
     result = {
         "tempmail": {
-            "available": True,
-            "count": 2,
-            "services": [{
-                "id": None,
-                "name": "Tempmail.lol",
-                "type": "tempmail",
-                "description": "临时邮箱，自动创建"
-            }, {
-                "id": None,
-                "name": "Generator.email",
-                "type": "generator_email",
-                "description": "临时邮箱，自动创建"
-            }]
+            "available": False,
+            "count": 0,
+            "services": []
         },
         "outlook": {
             "available": False,
