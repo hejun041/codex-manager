@@ -1098,16 +1098,11 @@ class RegistrationEngine:
     ):
         url = f"{self.AUTH}/api/accounts/create_account"
         headers = {
-            "Content-Type": "application/json", "Accept": "application/json",
-            "Referer": f"{self.AUTH}/about-you", "Origin": self.AUTH,
-            "User-Agent": self.ua, "oai-device-id": self.device_id,
-            "sec-ch-ua": self.sec_ch_ua, "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"', "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors", "sec-fetch-site": "same-origin",
+            "referer": f"{self.AUTH}/about-you",
+            "accept": "application/json",
+            "content-type": "application/json",
         }
-        headers.update(_make_trace_headers())
         payload = {"name": name, "birthdate": birthdate}
-        if so_token: headers["openai-sentinel-token"] = so_token
 
         r = self._request_with_retry(
             "post",
@@ -1121,27 +1116,6 @@ class RegistrationEngine:
         )
         if r is None:
             return 0, {"error": "create_account_request_failed"}
-
-        if r.status_code == 400 and "registration_disallowed" in (r.text or ""):
-            self._log("registration_disallowed, 重新获取 sentinel 重试...")
-            fresh_token = build_sentinel_token(
-                self.session, self.device_id, flow="oauth_create_account",
-                user_agent=self.ua, sec_ch_ua=self.sec_ch_ua, impersonate=self.impersonate,
-            )
-            if fresh_token:
-                headers["openai-sentinel-token"] = fresh_token
-                r = self._request_with_retry(
-                    "post",
-                    url,
-                    label="Create Account(重试)",
-                    timeout=timeout,
-                    retries=retries,
-                    json=payload,
-                    headers=headers,
-                    impersonate=self.impersonate,
-                )
-                if r is None:
-                    return 0, {"error": "create_account_retry_failed"}
 
         try:
             data = r.json()
@@ -4226,6 +4200,7 @@ class RegistrationEngine:
             sentinel_token, so_token = self._fetch_sentinel_tokens()
 
             need_otp = False
+            account_created = False
             
             if "create-account/password" in final_path:
                 self._log("全新注册流程: 提交密码")
@@ -4241,8 +4216,10 @@ class RegistrationEngine:
             elif "about-you" in final_path:
                 self._log("跳到 about-you")
                 _random_delay(0.5, 1.0)
-                self.create_account(name, birthdate, so_token)
-                self.callback()
+                about_status, about_data = self.create_account(name, birthdate, retries=2)
+                if about_status != 200:
+                    raise Exception(f"Create Account 失败 ({about_status}): {self._short_log_text(about_data, 220)}")
+                account_created = True
             elif "callback" in final_path or "chatgpt.com" in final_url:
                 self._log("跳过注册，直接回调")
             else:
@@ -4278,31 +4255,22 @@ class RegistrationEngine:
                             status, data = self.validate_otp(otp_code, sentinel_token)
                         if status != 200: raise Exception("OTP验证反复失败")
 
-            # 继续流程
-            continue_url = ""
-            if 'data' in locals() and isinstance(data, dict):
-                continue_url = data.get("continue_url", "")
-            if not continue_url: continue_url = f"{self.AUTH}/about-you"
-            if continue_url.startswith("/"): continue_url = f"{self.AUTH}{continue_url}"
-
-            _random_delay(0.5, 1.0)
-            try:
-                self.session.get(continue_url, headers={
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Referer": f"{self.AUTH}/email-verification", "Upgrade-Insecure-Requests": "1",
-                }, allow_redirects=True, impersonate=self.impersonate)
-            except Exception as e:
-                self._log(f"访问 about-you 可能由于回调重定向断开: {e}")
-
-            _random_delay(0.5, 1.5)
-            status, data = self.create_account(name, birthdate, so_token)
-            
-            _random_delay(0.2, 0.5)
-            self.callback()
+            # 继续流程：创建账号（对齐 any-auto-register 逻辑）
+            if not account_created:
+                self._log("创建用户账户...")
+                _random_delay(0.4, 0.9)
+                status, data = self.create_account(
+                    name,
+                    birthdate,
+                    retries=2,
+                )
+                if status != 200:
+                    raise Exception(f"Create Account 失败 ({status}): {self._short_log_text(data, 220)}")
             registration_completed = True
 
             # 抓取 Token
             if self.token_mode == "oauth":
+                self._log("注册完成，开始重新登录以获取 Token...")
                 self._log("尝试通过 OAuth 授权获取 Token（含 refresh_token）")
                 tokens = self.get_oauth_tokens()
                 if tokens and tokens.get("access_token"):
