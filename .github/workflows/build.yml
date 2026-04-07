@@ -13,7 +13,7 @@ on:
 
 jobs:
   build:
-    name: 打包 ${{ matrix.os }}
+    name: 打包 ${{ matrix.asset_name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -25,7 +25,10 @@ jobs:
           - os: ubuntu-latest
             artifact_name: codex-register
             asset_name: codex-register-linux-x64
-          - os: macos-latest
+          - os: macos-13
+            artifact_name: codex-register
+            asset_name: codex-register-macos-x64
+          - os: macos-14
             artifact_name: codex-register
             asset_name: codex-register-macos-arm64
 
@@ -143,6 +146,7 @@ jobs:
             |------|------|
             | Windows x64 | `codex-register-windows-x64.zip` |
             | Linux x64 | `codex-register-linux-x64.zip` |
+            | macOS Intel x64 | `codex-register-macos-x64.zip` |
             | macOS ARM64 | `codex-register-macos-arm64.zip` |
 
             ### 使用方法
